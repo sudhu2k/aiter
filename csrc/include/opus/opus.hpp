@@ -1479,9 +1479,9 @@ OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) 
 
 // entry point for vectorized cast(), non-dpacks
 template<typename D, typename S, typename... Aux, std::enable_if_t<((is_vector_v<S> || is_tuple_v<S> || is_array_v<S>) && !is_packs_v<D> && !is_packs_v<get_value_t<S>>)
-    && !(is_any_of_v<S, bf16x2_t, bf16x4_t>&& std::is_same_v<D, fp8_t >)
-    && !(is_any_of_v<S, fp32x2_t, fp32x4_t>&& std::is_same_v<D, fp8_t >)
-    && !(is_any_of_v<S, fp8x2_t , fp8x4_t >&& std::is_same_v<D, fp32_t>)
+    && !(is_any_of_v<S, bf16x2_t, bf16x4_t> && std::is_same_v<D, fp8_t >)
+    && !(is_any_of_v<S, fp32x2_t, fp32x4_t> && std::is_same_v<D, fp8_t >)
+    && !(is_any_of_v<S, fp8x2_t , fp8x4_t > && std::is_same_v<D, fp32_t>)
 , bool> = true>
 OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
     if      constexpr (std::is_same_v<get_value_t<S>, fp32_t> && size<S>() % 4 == 0 && std::is_same_v<D, fp8_t>) { // fp32 -> fp8 , x4N
@@ -3489,16 +3489,6 @@ struct tiled_mma_adaptor : public MMA_ {
         return c_;
     }
 
-    // Tiled per-sub-MFMA iteration with COMPILE-TIME (i_m, i_n, i_k) indices.
-    template<typename VA, typename VB, typename Fn>
-    OPUS_D constexpr void for_each_sub(const VA& a, const VB& b, Fn&& fn) const {
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            fn(i_m, i_n, i_k,
-               a[i_m.value * EXPAND_K + i_k.value],
-               b[i_n.value * EXPAND_K + i_k.value]);
-        });
-    }
-
     template<typename VA, typename VB, typename VC, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b, number<scale_op_sel_a> = {}, number<scale_op_sel_b> = {}) {
@@ -3520,6 +3510,21 @@ struct tiled_mma_adaptor : public MMA_ {
             set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
         });
         return c_;
+    }
+
+    // Native C-array tile fragments with caller-provided per-sub-MFMA policy.
+    template<index_t C_N, index_t c_n_base = 0, typename VA, typename VB, typename C, typename ScaleA, typename ScaleB, typename Policy>
+    OPUS_D constexpr void operator()(const VA (&a)[EXPAND_M * EXPAND_K], const VB (&b)[EXPAND_N * EXPAND_K],
+                                     C (&c)[EXPAND_M][C_N], const ScaleA& scale_a, const ScaleB& scale_b,
+                                     Policy policy, number<c_n_base> = {}) const {
+        static_assert(c_n_base >= 0 && c_n_base + EXPAND_N <= C_N);
+        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
+            constexpr index_t i_a = i_m * EXPAND_K + i_k;
+            constexpr index_t i_b = i_n * EXPAND_K + i_k;
+            constexpr index_t i_c_n = c_n_base + i_n;
+            c[i_m][i_c_n] = policy.template operator()<MMA>(
+                a[i_a], b[i_b], c[i_m][i_c_n], scale_a, scale_b, i_m, i_n, i_k, number<i_c_n>{});
+        });
     }
 
     template<typename VA, typename VB, index_t scale_op_sel_a = 0, index_t scale_op_sel_b = 0>

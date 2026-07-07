@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-// K5 generic loop schedule for non-K3 bring-up; instantiated from shared load/compute helpers.
+// K5 loop schedule for non-production bring-up; instantiated from shared load/compute helpers.
 #pragma once
 
 #include "opus_moe_pipeline_stage2_a8w4_decode_policy_gfx950.cuh"
@@ -9,8 +9,6 @@
 #include "opus/opus.hpp"
 
 template<typename T,
-         typename V_A,
-         typename V_B,
          typename LayoutA,
          typename LayoutASmem,
          typename SmemA,
@@ -18,7 +16,7 @@ template<typename T,
          typename GmemAScale,
          typename GmemWScale,
          typename ComputeKTile>
-inline __device__ void opus_moe_stage2_a8w4_decode_run_generic_schedule_gfx950(
+inline __device__ void opus_moe_stage2_a8w4_decode_run_k5_schedule_gfx950(
     int col_base,
     const LayoutA& u_ga,
     const LayoutASmem& u_sa,
@@ -33,6 +31,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_run_generic_schedule_gfx950(
     ComputeKTile& compute_k_tile_both_n_halves)
 {
     using namespace opus;
+
+    static_assert(T::K_TILES == 5);
 
     static_for<T::K_TILES>([&](auto kt) {
         opus_moe_stage2_a8w4_decode_issue_a<T>(
