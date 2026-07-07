@@ -132,12 +132,13 @@ def _route_reduce_instantiation_rows() -> list[tuple[int, int]]:
     return list(dict.fromkeys(rows))
 
 
-def _a8w4_device_tu_contents(impl_name: str, traits_alias: str) -> str:
+def _a8w4_device_tu_contents(traits_alias: str, traits_type: str) -> str:
     return (
         "// SPDX-License-Identifier: MIT\n"
         "// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.\n"
         "// Auto-generated A8W4 decode device TU; do not edit.\n"
-        f'#include "impl/{impl_name}"\n'
+        f'#include "{A8W4_PIPELINE_HEADER}"\n'
+        f"using {traits_alias} = {traits_type};\n"
         f"template __global__ void {A8W4_KERNEL_FUNC}<{traits_alias}>(\n"
         "    opus_moe_stage2_a8w4_kargs);\n"
     )
@@ -252,8 +253,8 @@ void {launcher}(const opus_moe_stage2_a8w4_kargs& kargs, hipStream_t stream)
         for kid in sorted(STAGE2_A8W4_KERNELS):
             (self.instances_path / f"{_a8w4_launcher_name(kid)}.device.cu").write_text(
                 _a8w4_device_tu_contents(
-                    _a8w4_impl_filename(kid),
                     _a8w4_traits_alias(kid),
+                    _a8w4_traits_type(STAGE2_A8W4_KERNELS[kid]),
                 ),
                 encoding="utf-8",
             )
