@@ -27,8 +27,7 @@ columns out of the shared tile. ``warps_n = warps_k = 1`` reduces to the single-
 
 The transpose-read lane addressing mirrors the CK recipe in ``chunk_gated_delta_h.py``:
 an 8-wide bf16 K-fragment is two ``ds_read_tr16_b64`` (lo / hi, offset by 4 rows)
-shuffled together. The tile is stride-padded (not XOR-swizzled): a row-dependent XOR
-would break the hardware transpose alignment.
+shuffled together.
 """
 
 from __future__ import annotations
@@ -66,28 +65,7 @@ FILL_V = 8
 # Overridable via env for sweeps; default chosen from the LDS_PAD ATT sweep.
 LDS_PAD = int(os.environ.get("MOE_WGRAD_LDS_PAD", "8"))
 
-# Row-group XOR swizzle: an alternative to stride padding for LDS bank-conflict
-# relief. When enabled it lets ``LDS_PAD`` drop to 0 (smaller tile -> higher
-# occupancy) while still spreading the transpose read across banks. See
-# ``_swz_col_i32`` for the correctness argument; A/B via MOE_WGRAD_SWIZZLE=1.
-SWIZZLE = os.environ.get("MOE_WGRAD_SWIZZLE", "0") == "1"
-
 WGRAD_BLOCK_M = 32  # contraction (slot) step; matches the align block_size
-
-# Manual `s_waitcnt ; s_barrier` scaffolding (default off). NOTE: on the current
-# pipeline this is a *no-op* vs `gpu.barrier()` -- ATT (att_v2_idxpf) shows the
-# compiler already lowers the per-step barrier to `s_waitcnt lgkmcnt(0)` with no
-# `vmcnt` wait, because the staged loads are consumed (vmcnt-waited) at their store
-# site. The value of this helper is that it is the reusable primitive for the
-# HK-style fine-grained mi-group barriers (explicit partial counts) that the
-# read->MFMA `lgkmcnt` work needs; the flag just lets us A/B the plain swap.
-BARRIER_LGKMCNT_ONLY = os.environ.get("MOE_WGRAD_BARRIER_LGKMCNT_ONLY", "0") == "1"
-
-# When set, emit a CK-style DS_READ<->MFMA cadence (sched_group_barrier via
-# sched_mfma/sched_dsrd) over the compute region so the LDS transpose reads interleave
-# with the matrix ops instead of forming one leading ds_read train that hits a single
-# lgkmcnt(0) with the whole backlog outstanding. Targets the read->MFMA lgkmcnt stall.
-SCHED_CADENCE = os.environ.get("MOE_WGRAD_SCHED_CADENCE", "0") == "1"
 
 # When set, double-buffer the A (grad) MFMA fragment across two distinct register sets:
 # a ``sched_barrier`` pins each ``read_a(mi+1)`` above tile ``mi``'s MFMAs so the read
@@ -97,33 +75,6 @@ SCHED_CADENCE = os.environ.get("MOE_WGRAD_SCHED_CADENCE", "0") == "1"
 # instead of stalling in front of them. Costs +4 VGPR (stays within the 4-wave bucket).
 # Default on (measured +2-11%, biggest tiles gain most); set to 0 to A/B the old path.
 ABUF = os.environ.get("MOE_WGRAD_ABUF", "1") == "1"
-
-
-def _waitcnt_barrier(vmcnt=63, lgkmcnt=63):
-    """Emit ``s_waitcnt {vmcnt/lgkmcnt} ; s_barrier`` via inline asm.
-
-    Lets the caller set explicit wait counts ahead of ``s_barrier`` instead of
-    relying on the compiler's default lowering -- e.g. ``lgkmcnt=0`` with
-    ``vmcnt=63`` (the "don't wait" sentinel) syncs only the LDS ping-pong. 63 is the
-    unconstrained sentinel for both counters.
-    """
-    wc = []
-    if vmcnt < 63:
-        wc.append(f"vmcnt({vmcnt})")
-    if lgkmcnt < 63:
-        wc.append(f"lgkmcnt({lgkmcnt})")
-    parts = []
-    if wc:
-        parts.append("s_waitcnt " + " ".join(wc))
-    parts.append("s_barrier")
-    _llvm.InlineAsmOp(
-        res=None,
-        operands_=[],
-        asm_string="\n".join(parts),
-        constraints="",
-        has_side_effects=True,
-        is_align_stack=False,
-    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -158,14 +109,7 @@ def compile_moe_wgrad_v2(
 
     SG = block_n + LDS_PAD           # grad LDS row stride (bf16 elems)
     SX = block_k + LDS_PAD           # x LDS row stride
-    # Row-group XOR swizzle masks: fold the transpose-atom group into each
-    # tile's FILL_V-chunk count so the swizzled column stays in range.
-    if SWIZZLE and (block_n & (block_n - 1)) != 0:
-        raise ValueError("MOE_WGRAD_SWIZZLE requires power-of-2 block_n")
-    if SWIZZLE and (block_k & (block_k - 1)) != 0:
-        raise ValueError("MOE_WGRAD_SWIZZLE requires power-of-2 block_k")
-    SWZ_MASK_G = block_n // FILL_V - 1
-    SWZ_MASK_X = block_k // FILL_V - 1
+    
     G_TILE_ELEMS = WGRAD_BLOCK_M * SG
     X_TILE_ELEMS = WGRAD_BLOCK_M * SX
     G_FILLS = (WGRAD_BLOCK_M * block_n) // (n_threads * FILL_V)
@@ -183,7 +127,7 @@ def compile_moe_wgrad_v2(
         f"moe_wgrad_{dtype}{'_mw' if MUL_W else ''}"
         f"_{block_n}x{block_k}_w{warps_n}x{warps_k}"
         f"{f'_tk{topk}' if topk is not None else ''}"
-        f"{f'_swz' if SWIZZLE else f'_p{LDS_PAD}'}_v2"
+        f"_p{LDS_PAD}_v2"
     )
 
     # LDS allocation: double-buffered grad tile + x tile (2 bytes/bf16, 2 buffers each).
@@ -329,8 +273,6 @@ def compile_moe_wgrad_v2(
                 if const_expr(MUL_W):
                     gvec = _scale_bf16_vec(gvec, w)
                 slot_idx, feat_idx, slot_i32, feat_i32 = _tile_idx(i, CPR_G)
-                if SWIZZLE:
-                    feat_idx = arith.index_cast(T.index, _swz_col_i32(slot_i32, feat_i32, SWZ_MASK_G))
                 vector.store(
                     valid.select(gvec, zero_v), g_lds,
                     [buf_elem + slot_idx * arith.index(SG) + feat_idx], alignment=16,
@@ -340,8 +282,6 @@ def compile_moe_wgrad_v2(
             for i in range_constexpr(X_FILLS):
                 xvec, valid, _ = raw[i]
                 slot_idx, feat_idx, slot_i32, feat_i32 = _tile_idx(i, CPR_X)
-                if SWIZZLE:
-                    feat_idx = arith.index_cast(T.index, _swz_col_i32(slot_i32, feat_i32, SWZ_MASK_X))
                 vector.store(
                     valid.select(xvec, zero_v), x_lds,
                     [buf_elem + slot_idx * arith.index(SX) + feat_idx], alignment=16,
@@ -357,7 +297,7 @@ def compile_moe_wgrad_v2(
                 col_base = warp_n_base + fx.Int32(mi * WMMA_M)
                 return _tr_read_frag(
                     g_lds_off, SG, col_base, lane_m_base, tr_k_group, tr_col_sub,
-                    SWZ_MASK_G, g_buf_byte,
+                    g_buf_byte,
                 )
 
             b_frags = []
@@ -366,7 +306,7 @@ def compile_moe_wgrad_v2(
                 b_frags.append(
                     _tr_read_frag(
                         x_lds_off, SX, col_base, lane_m_base, tr_k_group, tr_col_sub,
-                        SWZ_MASK_X, x_buf_byte,
+                        x_buf_byte,
                     )
                 )
             new_accs = [None] * NACC
@@ -376,39 +316,18 @@ def compile_moe_wgrad_v2(
                 a_cur = a_next
                 if const_expr(mi + 1 < M_STEPS):
                     a_next = read_a(mi + 1)  # prefetch next A while MFMA-ing current
-                    if ABUF:
-                        # Fence the next-A read above this tile's MFMAs so it can't sink
-                        # below them; keeps a_cur/a_next in distinct regs and turns the
-                        # pre-MFMA wait into a partial lgkmcnt (overlap, not full stall).
-                        rocdl.sched_barrier(0)
                 for nj in range_constexpr(N_STEPS):
                     idx = mi * N_STEPS + nj
                     new_accs[idx] = rocdl.mfma_f32_16x16x32_bf16(
                         T.vec(C_FRAG, T.f32), [a_cur, b_frags[nj], accs[idx], 0, 0, 0]
                     )
-            if SCHED_CADENCE:
-                # Describe the intended schedule of the region above: the shared B
-                # fragments (2 ds_read each) up front -- the first MFMA needs all of
-                # them -- then, per mi, the A fragment (2 ds_read) interleaved right
-                # before its N_STEPS MFMAs. This keeps reads spread through the MFMA
-                # train so each lgkmcnt waits on only its group, not the full backlog.
-                rocdl.sched_barrier(0)
-                rocdl.sched_dsrd(2 * N_STEPS)
-                for _mi in range_constexpr(M_STEPS):
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(N_STEPS)
                 rocdl.sched_barrier(0)
             rocdl.s_setprio(0)
             return new_accs
 
         def _barrier():
-            # Per-step ping-pong sync. By default a plain workgroup barrier (compiler
-            # emits vmcnt(0)+lgkmcnt(0)); with the flag, an LDS-only barrier that keeps
-            # the hidden global loads / slot-id prefetch in flight across the barrier.
-            if BARRIER_LGKMCNT_ONLY:
-                _waitcnt_barrier(lgkmcnt=0)
-            else:
-                gpu.barrier()
+            # Per-step ping-pong sync
+            gpu.barrier()
 
         acc_init = [arith.constant_vector(0.0, T.vec(C_FRAG, T.f32)) for _ in range(NACC)]
         step = arith.index(WMMA_K)
@@ -524,31 +443,8 @@ def compile_moe_wgrad_v2(
 
     return launch_wgrad
 
-
-def _swz_col_i32(row, col, chunk_mask):
-    """Row-group XOR swizzle on the feature column (bf16 elems); no-op unless ``SWIZZLE``.
-
-    Keyed on the 4-row transpose-atom group (``row >> 2``): within one
-    ``ds_read_tr16_b64`` the 16 participating lanes all share the same
-    ``lane_m_base`` (row // 8), hence the same group, so the XOR offset is
-    constant across the instruction and the HW transpose stays coherent
-    (a per-row XOR would shear the block and corrupt the transpose).
-
-    The XOR is applied at FILL_V (8-bf16 = 16 B) granularity so the coalesced
-    vector store stays aligned; ``chunk_mask = tile_cols//FILL_V - 1`` folds the
-    group into the tile's chunk count so the swizzled column stays in range.
-    The *same* function is applied on the LDS write and the transpose read, so
-    it is a bijection on (row, col) -> physical slot and correct by construction
-    regardless of ``chunk_mask``.
-    """
-    if not SWIZZLE:
-        return col
-    grp = (row >> fx.Int32(2)) & fx.Int32(chunk_mask)
-    return col ^ (grp << fx.Int32(3))  # 3 == log2(FILL_V)
-
-
 def _tr_read_frag(
-    lds_off, stride, feat_col_base, lane_m_base, tr_k_group, tr_col_sub, swz_mask, buf_byte=None
+    lds_off, stride, feat_col_base, lane_m_base, tr_k_group, tr_col_sub, buf_byte=None
 ):
     """ds_read_tr16_b64 A/B fragment for a 16-wide feature column base from a [slot,feat] tile.
 
@@ -561,10 +457,7 @@ def _tr_read_frag(
     row_hi = row_lo + fx.Int32(4)                    # lo/hi are 4 rows apart
 
     def _byte(row):
-        # lo and hi land in different 4-row groups, so each needs its own swizzle
-        # (can't just add 4 rows of bytes to the lo address once swizzled).
-        col = _swz_col_i32(row, col_tr, swz_mask)
-        elem = row * fx.Int32(stride) + col
+        elem = row * fx.Int32(stride) + col_tr
         b = elem * fx.Int32(2) + fx.Int32(lds_off)
         if buf_byte is not None:
             b = b + buf_byte
