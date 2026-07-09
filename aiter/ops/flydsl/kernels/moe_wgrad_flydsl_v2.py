@@ -115,14 +115,6 @@ def compile_moe_wgrad_v2(
     G_FILLS = (WGRAD_BLOCK_M * block_n) // (n_threads * FILL_V)
     X_FILLS = (WGRAD_BLOCK_M * block_k) // (n_threads * FILL_V)
 
-    # The slot ids are a property of the 32-slot contraction step, not of the grad/x
-    # tile: for step s, row r has id sorted[base_slot + s + r] regardless of which tile
-    # consumes it. When block_n == block_k the grad and x fill mappings (CPR_G vs CPR_X)
-    # are identical, so g_ids[i] and x_ids[i] are the same load -- issue them once and
-    # feed both gathers. (The compiler already CSEs the duplicate; this just keeps the
-    # source honest and the carried iter_args minimal.)
-    SHARE_SLOT_IDS = block_n == block_k
-
     KERNEL_NAME = (
         f"moe_wgrad_{dtype}{'_mw' if MUL_W else ''}"
         f"_{block_n}x{block_k}_w{warps_n}x{warps_k}"
@@ -233,11 +225,8 @@ def compile_moe_wgrad_v2(
                 buffer_load_i32_idx(sorted_rsrc, base_slot + s_base_idx + _tile_idx(i, CPR_G)[0])
                 for i in range_constexpr(G_FILLS)
             ]
-            # When block_n == block_k the x fill mapping is identical, so the x slot ids
-            # are the same loads -- reuse g_ids instead of re-issuing them. Use a ternary
-            # (not an if-statement): FlyDSL rewrites `if` into a scoped conditional, and the
-            # else-branch comprehension must stay unevaluated when sharing.
-            x_ids = g_ids if SHARE_SLOT_IDS else [
+
+            x_ids = [
                 buffer_load_i32_idx(sorted_rsrc, base_slot + s_base_idx + _tile_idx(i, CPR_X)[0])
                 for i in range_constexpr(X_FILLS)
             ]
@@ -294,19 +283,17 @@ def compile_moe_wgrad_v2(
             # runs at raised priority so the matrix pipe stays fed while reads are in
             # flight instead of the scheduler round-robining to a stalled wave.
             def read_a(mi):
-                col_base = warp_n_base + fx.Int32(mi * WMMA_M)
                 return _tr_read_frag(
-                    g_lds_off, SG, col_base, lane_m_base, tr_k_group, tr_col_sub,
-                    g_buf_byte,
+                    g_lds_off, SG, warp_n_base, mi * WMMA_M,
+                    lane_m_base, tr_k_group, tr_col_sub, g_buf_byte,
                 )
 
             b_frags = []
             for nj in range_constexpr(N_STEPS):
-                col_base = warp_k_base + fx.Int32(nj * WMMA_N)
                 b_frags.append(
                     _tr_read_frag(
-                        x_lds_off, SX, col_base, lane_m_base, tr_k_group, tr_col_sub,
-                        x_buf_byte,
+                        x_lds_off, SX, warp_k_base, nj * WMMA_N,
+                        lane_m_base, tr_k_group, tr_col_sub, x_buf_byte,
                     )
                 )
             new_accs = [None] * NACC
@@ -335,7 +322,7 @@ def compile_moe_wgrad_v2(
         # When sharing slot ids (block_n == block_k), only the grad ids are carried through
         # the loop; the x ids alias them. Otherwise both id vectors are carried.
         def _pack_ids(g_ids, x_ids):
-            return g_ids if SHARE_SLOT_IDS else (g_ids + x_ids)
+            return (g_ids + x_ids)
 
         # 2-stage ping-pong pipeline: MFMA the current LDS buffer while the next step's
         # global gather is in flight, then stage it into the *other* buffer -- so a single
@@ -354,9 +341,7 @@ def compile_moe_wgrad_v2(
             s_base = loop.induction_variable
             accs = [loop.body.arguments[1 + i] for i in range(NACC)]
             g_ids = [loop.body.arguments[1 + NACC + i] for i in range(G_FILLS)]
-            x_ids = g_ids if SHARE_SLOT_IDS else [
-                loop.body.arguments[1 + NACC + G_FILLS + i] for i in range(X_FILLS)
-            ]
+            x_ids = [loop.body.arguments[1 + NACC + G_FILLS + i] for i in range(X_FILLS)]
 
             it = fx.Int32(arith.index_cast(T.i32, s_base)) // fx.Int32(WMMA_K)
             cur = it % fx.Int32(2)
@@ -444,34 +429,52 @@ def compile_moe_wgrad_v2(
     return launch_wgrad
 
 def _tr_read_frag(
-    lds_off, stride, feat_col_base, lane_m_base, tr_k_group, tr_col_sub, buf_byte=None
+    lds_off, stride, warp_col_base, col_const, lane_m_base, tr_k_group, tr_col_sub, buf_byte=None
 ):
     """ds_read_tr16_b64 A/B fragment for a 16-wide feature column base from a [slot,feat] tile.
 
-    ``feat_col_base`` is the (runtime) element column of the atom's first feature.
-    ``buf_byte`` optionally selects a ping-pong buffer (runtime byte offset).
-    Returns an 8xbf16 MFMA fragment (contraction = 32 slots, feature = 16).
+    The atom's first feature column is ``warp_col_base + col_const`` where
+    ``warp_col_base`` is the (runtime) per-warp base and ``col_const`` is the
+    compile-time per-fragment shift (``mi*WMMA_M`` / ``nj*WMMA_N``). Keeping them
+    separate lets the base LDS pointer stay loop- *and* fragment-invariant (so CSE
+    collapses it to a single live address) while the per-fragment column shift and
+    the lo->hi row shift fold into the ``ds_read`` immediate ``offset`` field
+    instead of each consuming a VGPR. ``buf_byte`` optionally selects a ping-pong
+    buffer (runtime byte offset). Returns an 8xbf16 MFMA fragment (contraction =
+    32 slots, feature = 16).
     """
-    col_tr = feat_col_base + tr_col_sub * fx.Int32(4)
+    col_run = warp_col_base + tr_col_sub * fx.Int32(4)
     row_lo = lane_m_base * fx.Int32(8) + tr_k_group  # 0..31 (bt_s == 0)
-    row_hi = row_lo + fx.Int32(4)                    # lo/hi are 4 rows apart
+    base_elem = row_lo * fx.Int32(stride) + col_run
+    base_byte = base_elem * fx.Int32(2) + fx.Int32(lds_off)
+    if buf_byte is not None:
+        base_byte = base_byte + buf_byte
+    byte_idx = arith.index_cast(T.index, base_byte)
+    byte_i64 = arith.index_cast(T.i64, byte_idx)
+    base_ptr = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), byte_i64).result
 
-    def _byte(row):
-        elem = row * fx.Int32(stride) + col_tr
-        b = elem * fx.Int32(2) + fx.Int32(lds_off)
-        if buf_byte is not None:
-            b = b + buf_byte
-        return b
-
-    lo = _ds_read_tr_bf16x4(_byte(row_lo))
-    hi = _ds_read_tr_bf16x4(_byte(row_hi))
+    col_byte = 2 * col_const     # compile-time feature-column shift (bytes)
+    hi_byte = 2 * 4 * stride     # compile-time lo->hi row shift (bytes, 4 rows apart)
+    lo = _ds_read_tr_bf16x4(base_ptr, col_byte)
+    hi = _ds_read_tr_bf16x4(base_ptr, col_byte + hi_byte)
     return lo.shuffle(hi, [0, 1, 2, 3, 4, 5, 6, 7])
 
 
-def _ds_read_tr_bf16x4(lds_byte_offset):
-    byte_idx = arith.index_cast(T.index, lds_byte_offset)
-    byte_i64 = arith.index_cast(T.i64, byte_idx)
-    ptr = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), byte_i64).result
+def _ds_read_tr_bf16x4(base_ptr, const_byte=0):
+    # `const_byte` is a compile-time byte offset added via an inbounds getelementptr
+    # so the AMDGPU backend folds it into the ds_read `offset:` immediate rather than
+    # materializing a distinct address VGPR per fragment.
+    if const_byte:
+        ptr = _llvm.GEPOp(
+            ir.Type.parse("!llvm.ptr<3>"),
+            base_ptr,
+            [],
+            [const_byte],
+            ir.IntegerType.get_signless(8),
+            _llvm.GEPNoWrapFlags.inboundsFlag,
+        ).result
+    else:
+        ptr = base_ptr
     raw = rocdl.ds_read_tr16_b64(T.vec(4, T.bf16), ptr).result
     return fx.Vector(raw, (4,), fx.BFloat16)
 
