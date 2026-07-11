@@ -67,15 +67,6 @@ LDS_PAD = int(os.environ.get("MOE_WGRAD_LDS_PAD", "8"))
 
 WGRAD_BLOCK_M = 32  # contraction (slot) step; matches the align block_size
 
-# When set, double-buffer the A (grad) MFMA fragment across two distinct register sets:
-# a ``sched_barrier`` pins each ``read_a(mi+1)`` above tile ``mi``'s MFMAs so the read
-# cannot sink below them (which would let the allocator alias a_cur/a_next into the same
-# regs and force a full ``lgkmcnt(0)``). Kept live, the two fragments get distinct regs
-# and LLVM emits a *partial* ``lgkmcnt`` -- the next A read overlaps the current MFMAs
-# instead of stalling in front of them. Costs +4 VGPR (stays within the 4-wave bucket).
-# Default on (measured +2-11%, biggest tiles gain most); set to 0 to A/B the old path.
-ABUF = os.environ.get("MOE_WGRAD_ABUF", "1") == "1"
-
 
 @functools.lru_cache(maxsize=None)
 def compile_moe_wgrad_v2(
@@ -277,9 +268,11 @@ def compile_moe_wgrad_v2(
                 )
 
         def compute(accs, g_buf_byte, x_buf_byte):
-            # B fragments (reused across all mi) are read once up front. A fragments are
-            # read one-per-mi to keep VGPR pressure low (hoisting all of them costs
-            # occupancy, which the large tile-count shapes depend on). The MFMA region
+            # A fragments are read one-per-mi to keep VGPR pressure low (hoisting all of
+            # them costs occupancy, which the large tile-count shapes depend on). B
+            # fragments are loop-invariant across mi, so they are fetched exactly once --
+            # but interleaved with the mi==0 MFMAs (see below) rather than as a serial
+            # burst up front, so their ds_read latency overlaps compute. The MFMA region
             # runs at raised priority so the matrix pipe stays fed while reads are in
             # flight instead of the scheduler round-robining to a stalled wave.
             def read_a(mi):
@@ -288,22 +281,27 @@ def compile_moe_wgrad_v2(
                     lane_m_base, tr_k_group, tr_col_sub, g_buf_byte,
                 )
 
-            b_frags = []
-            for nj in range_constexpr(N_STEPS):
-                b_frags.append(
-                    _tr_read_frag(
-                        x_lds_off, SX, warp_k_base, nj * WMMA_N,
-                        lane_m_base, tr_k_group, tr_col_sub, x_buf_byte,
-                    )
+            def read_b(nj):
+                return _tr_read_frag(
+                    x_lds_off, SX, warp_k_base, nj * WMMA_N,
+                    lane_m_base, tr_k_group, tr_col_sub, x_buf_byte,
                 )
+
             new_accs = [None] * NACC
+            b_frags = [None] * N_STEPS
             a_next = read_a(0)
+            b_frags[0] = read_b(0)  # first B needed for the very first MFMA
             rocdl.s_setprio(1)
             for mi in range_constexpr(M_STEPS):
                 a_cur = a_next
                 if const_expr(mi + 1 < M_STEPS):
                     a_next = read_a(mi + 1)  # prefetch next A while MFMA-ing current
                 for nj in range_constexpr(N_STEPS):
+                    # Prefetch the next B fragment during the first mi only; its ds_read
+                    # then overlaps this step's MFMA and all later mi reuse the resident
+                    # frag. No extra VGPR: every B frag is live from mi==0 onward anyway.
+                    if const_expr(mi == 0 and nj + 1 < N_STEPS):
+                        b_frags[nj + 1] = read_b(nj + 1)
                     idx = mi * N_STEPS + nj
                     new_accs[idx] = rocdl.mfma_f32_16x16x32_bf16(
                         T.vec(C_FRAG, T.f32), [a_cur, b_frags[nj], accs[idx], 0, 0, 0]
