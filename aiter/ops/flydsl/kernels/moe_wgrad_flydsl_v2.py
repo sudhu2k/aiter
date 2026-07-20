@@ -3,11 +3,19 @@
 
 """Permute-free MoE weight-gradient (wgrad) grouped GEMM in FlyDSL -- v2 (LDS transpose).
 
-Same math as v0/v1::
+Route-list contract (matches the Triton ``fused_route_list_moe_wgrad`` kernel in
+TransformerEngine): the gradient operand is the *compact* ``[num_routes, N]`` buffer
+and ``SORTED`` maps each padded route slot to a received-token row::
 
-    dW[e][n, k] = sum_{routed slot s of e} grad[s, n] * x[token(s), k]
+    dW[e][n, k] = sum_{routed slot s of e, valid} grad[route_start[e] + local(s), n]
+                                                 * x[SORTED[s], k]
 
-but the contraction tile is staged through LDS and transposed on-read:
+where ``local(s)`` is the slot's offset within expert ``e``'s block-padded range and
+padding slots (``SORTED[s] == num_recv_tokens``) are masked to zero. The grad walk is a
+plain contiguous row scan (no ``SORTED`` indirection); ``SORTED`` is only consulted for
+the ``x`` gather token and the padding mask.
+
+The contraction tile is staged through LDS and transposed on-read:
 
   1. Coalesced fill: each 32-slot contraction step loads ``grad[slot, n_feat]`` and
      ``x[token(slot), k_feat]`` into LDS as ``[slot(row), feature(col)]`` tiles with
@@ -72,12 +80,10 @@ WGRAD_BLOCK_M = 32  # contraction (slot) step; matches the align block_size
 def compile_moe_wgrad_v2(
     *,
     dtype: str = "bf16",
-    mul_routed_weight: bool = False,
     block_n: int = 64,
     block_k: int = 64,
     warps_n: int = 1,
     warps_k: int = 1,
-    topk: int | None = None,
 ):
     if dtype != "bf16":
         raise ValueError(f"moe_wgrad v2 flydsl kernel only supports bf16, got {dtype!r}")
@@ -91,7 +97,6 @@ def compile_moe_wgrad_v2(
         raise ValueError("32*block_k must be a multiple of n_threads*FILL_V")
 
     gpu_arch = get_rocm_arch()
-    MUL_W = mul_routed_weight
     WN = block_n // warps_n          # per-warp grad-feature span
     WK = block_k // warps_k          # per-warp x-feature span
     M_STEPS = WN // WMMA_M           # grad-feature atoms per warp (MFMA-M)
@@ -107,9 +112,8 @@ def compile_moe_wgrad_v2(
     X_FILLS = (WGRAD_BLOCK_M * block_k) // (n_threads * FILL_V)
 
     KERNEL_NAME = (
-        f"moe_wgrad_{dtype}{'_mw' if MUL_W else ''}"
+        f"moe_wgrad_routelist_{dtype}"
         f"_{block_n}x{block_k}_w{warps_n}x{warps_k}"
-        f"{f'_tk{topk}' if topk is not None else ''}"
         f"_p{LDS_PAD}_v2"
     )
 
@@ -123,16 +127,15 @@ def compile_moe_wgrad_v2(
     @flyc.kernel(known_block_size=[n_threads, 1, 1])
     def wgrad_kernel(
         dW: fx.Pointer,          # [E, N, K] bf16 output
-        X: fx.Pointer,           # [num_tokens, K] bf16
-        GRAD: fx.Pointer,        # [num_tokens * top_k, N] bf16
-        TOPK_W: fx.Pointer,      # [num_tokens * top_k] f32
-        SORTED: fx.Pointer,      # [padded] i32 routed-slot ids grouped by expert
-        BLOCK_START: fx.Pointer,      # [E] i32
+        X: fx.Pointer,           # [num_recv_tokens, K] bf16 (received-token activations)
+        GRAD: fx.Pointer,        # [num_routes, N] bf16 (compact per-route gradient)
+        SORTED: fx.Pointer,      # [padded] i32 received-token row per route slot (sentinel = num_recv_tokens)
+        BLOCK_START: fx.Pointer,      # [E] i32 (block units)
         BLOCKS_PER_EXPERT: fx.Pointer,  # [E] i32
+        ROUTE_START: fx.Pointer,  # [E] i32 (compact first-route index = cumsum(counts) - counts)
         N: fx.Int32,
         K: fx.Int32,
-        num_valid_tokens: fx.Int32,
-        top_k: fx.Int32,
+        num_recv_tokens: fx.Int32,
     ):
         bf16 = T.bf16
         c0 = arith.constant(0, index=True)
@@ -143,8 +146,7 @@ def compile_moe_wgrad_v2(
         sorted_rsrc = ptr_rsrc(SORTED)
         bstart_rsrc = ptr_rsrc(BLOCK_START)
         bpe_rsrc = ptr_rsrc(BLOCKS_PER_EXPERT)
-        if const_expr(MUL_W):
-            w_rsrc = ptr_rsrc(TOPK_W)
+        rstart_rsrc = ptr_rsrc(ROUTE_START)
 
         base_ptr = allocator.get_base()
         g_lds_ptr = SmemPtr(base_ptr, g_lds_off, bf16, shape=(2 * G_TILE_ELEMS,))
@@ -171,22 +173,22 @@ def compile_moe_wgrad_v2(
 
         N_idx = arith.index_cast(T.index, N)
         K_idx = arith.index_cast(T.index, K)
-        nvalid_idx = arith.index_cast(T.index, num_valid_tokens)
-        # `token = slot // topk` is a per-element divide. With a compile-time topk the
-        # divisor is constant so LLVM lowers it to a shift (pow2) or magic-number mul,
-        # instead of the v_rcp/v_cvt software-division sequence used for a runtime arg.
-        topk_idx = arith.index(topk) if topk is not None else arith.index_cast(T.index, top_k)
+        nrecv_idx = arith.index_cast(T.index, num_recv_tokens)
 
         n_block_base = n_tile * block_n
         k_block_base = k_tile * block_k
         n_base_idx = arith.index_cast(T.index, n_block_base)
         k_base_idx = arith.index_cast(T.index, k_block_base)
 
-        # Per-expert routed-slot range.
+        # Per-expert routed-slot range. ``base_slot`` is the block-padded slot offset into
+        # ``SORTED`` (holds the received-token row for the ``x`` gather); ``route_start_e``
+        # is the compact first-route index into the ``[num_routes, N]`` grad buffer.
         bstart = buffer_load_i32(bstart_rsrc, expert)
         nblocks = buffer_load_i32(bpe_rsrc, expert)
+        rstart = buffer_load_i32(rstart_rsrc, expert)
         base_slot = arith.index_cast(T.index, bstart) * arith.index(WGRAD_BLOCK_M)
         num_slots = arith.index_cast(T.index, nblocks) * arith.index(WGRAD_BLOCK_M)
+        route_start_e_idx = arith.index_cast(T.index, rstart)
 
         zero_v = arith.constant_vector(0.0, T.vec(FILL_V, bf16))
         CPR_G = block_n // FILL_V
@@ -223,35 +225,57 @@ def compile_moe_wgrad_v2(
             ]
             return g_ids, x_ids
 
-        def gather_grad(g_ids):
+        def gather_grad(g_ids, slot_base_idx):
+            # The grad operand is the compact ``[num_routes, N]`` buffer: the row for a
+            # routed slot is ``route_start_e + (slot_base + slot_within_tile)`` -- a plain
+            # contiguous walk that needs no ``SORTED`` indirection. ``SORTED`` is still read
+            # (``g_ids``) only to get the slot's received-token, whose sentinel marks the
+            # block-padding rows that must be masked to zero.
+            #
+            # ``in_range`` guards the last pipeline step: the gather runs one contraction tile
+            # ahead, so on the final iteration ``slot_base == num_slots`` (one past the
+            # expert). Those overrun slots read ``SORTED`` past the expert's region -- which,
+            # with a tight ``[num_routes, N]`` grad, would compute an out-of-bounds
+            # ``grad_row`` -- so we mask them to row 0 exactly like the Triton ``row <
+            # num_slots`` mask. (The overrun tile's result is never consumed.)
             raw = []
             for i in range_constexpr(G_FILLS):
-                feat_idx = _tile_idx(i, CPR_G)[1]
-                sidx = arith.index_cast(T.index, g_ids[i])
-                valid = arith.cmpi(arith.CmpIPredicate.ult, sidx, nvalid_idx)
-                goff = valid.select(sidx, c0) * N_idx + n_base_idx + feat_idx
+                slot_idx, feat_idx = _tile_idx(i, CPR_G)[:2]
+                token = arith.index_cast(T.index, g_ids[i])
+                in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, slot_base_idx + slot_idx, num_slots
+                )
+                valid = arith.andi(
+                    in_range, arith.cmpi(arith.CmpIPredicate.ult, token, nrecv_idx)
+                )
+                grad_row = route_start_e_idx + slot_base_idx + slot_idx
+                goff = valid.select(grad_row, c0) * N_idx + n_base_idx + feat_idx
                 gvec = buffer_load_bf16_vec(grad_rsrc, goff, FILL_V)
-                w = buffer_load_f32(w_rsrc, valid.select(sidx, c0)) if const_expr(MUL_W) else None
-                raw.append((gvec, valid, w))
+                raw.append((gvec, valid, None))
             return raw
 
-        def gather_x(x_ids):
+        def gather_x(x_ids, slot_base_idx):
+            # ``SORTED`` holds the received-token row directly (no ``slot // top_k``): the
+            # activation gather is ``x[token, k_feat]`` with ``token = SORTED[route_pos]``.
+            # ``in_range`` masks the same one-tile pipeline overrun as ``gather_grad``.
             raw = []
             for i in range_constexpr(X_FILLS):
-                feat_idx = _tile_idx(i, CPR_X)[1]
-                sidx = arith.index_cast(T.index, x_ids[i])
-                valid = arith.cmpi(arith.CmpIPredicate.ult, sidx, nvalid_idx)
-                token = arith.divui(valid.select(sidx, c0), topk_idx)
-                xoff = token * K_idx + k_base_idx + feat_idx
+                slot_idx, feat_idx = _tile_idx(i, CPR_X)[:2]
+                token = arith.index_cast(T.index, x_ids[i])
+                in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, slot_base_idx + slot_idx, num_slots
+                )
+                valid = arith.andi(
+                    in_range, arith.cmpi(arith.CmpIPredicate.ult, token, nrecv_idx)
+                )
+                xoff = valid.select(token, c0) * K_idx + k_base_idx + feat_idx
                 xvec = buffer_load_bf16_vec(x_rsrc, xoff, FILL_V)
                 raw.append((xvec, valid, None))
             return raw
 
         def store_grad(raw, buf_elem):
             for i in range_constexpr(G_FILLS):
-                gvec, valid, w = raw[i]
-                if const_expr(MUL_W):
-                    gvec = _scale_bf16_vec(gvec, w)
+                gvec, valid, _ = raw[i]
                 slot_idx, feat_idx, slot_i32, feat_i32 = _tile_idx(i, CPR_G)
                 vector.store(
                     valid.select(gvec, zero_v), g_lds,
@@ -327,8 +351,8 @@ def compile_moe_wgrad_v2(
         # barrier per step suffices (no store->barrier->compute serialization). Slot ids run
         # one step ahead of the data (loaded here, consumed next iteration) via iter_args.
         g_ids0, x_ids0 = load_slot_ids(c0)
-        store_grad(gather_grad(g_ids0), c0)
-        store_x(gather_x(x_ids0), c0)
+        store_grad(gather_grad(g_ids0, c0), c0)
+        store_x(gather_x(x_ids0, c0), c0)
         _barrier()
         g_ids_next, x_ids_next = load_slot_ids(step)
 
@@ -350,8 +374,10 @@ def compile_moe_wgrad_v2(
             nxt_x_elem = arith.index_cast(T.index, nxt * fx.Int32(X_TILE_ELEMS))
 
             # Issue next step's data gather using the slot ids carried in (already resident).
-            g_regs_next = gather_grad(g_ids)
-            x_regs_next = gather_x(x_ids)
+            # The carried ids belong to slot base ``s_base + step`` (one contraction tile
+            # ahead), so the compact grad rows walk from that same base.
+            g_regs_next = gather_grad(g_ids, s_base + step)
+            x_regs_next = gather_x(x_ids, s_base + step)
             # Prefetch the slot ids two steps ahead; carried out to the next iteration so
             # their global-load latency overlaps this step's MFMA.
             g_ids_nxt, x_ids_nxt = load_slot_ids(s_base + step + step)
@@ -400,14 +426,13 @@ def compile_moe_wgrad_v2(
         dW: fx.Pointer,
         X: fx.Pointer,
         GRAD: fx.Pointer,
-        TOPK_W: fx.Pointer,
         SORTED: fx.Pointer,
         BLOCK_START: fx.Pointer,
         BLOCKS_PER_EXPERT: fx.Pointer,
+        ROUTE_START: fx.Pointer,
         N: fx.Int32,
         K: fx.Int32,
-        num_valid_tokens: fx.Int32,
-        top_k: fx.Int32,
+        num_recv_tokens: fx.Int32,
         num_experts: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -420,8 +445,8 @@ def compile_moe_wgrad_v2(
         gz = num_experts
         wgrad_kernel._func.__name__ = KERNEL_NAME
         wgrad_kernel(
-            dW, X, GRAD, TOPK_W, SORTED, BLOCK_START, BLOCKS_PER_EXPERT,
-            N, K, num_valid_tokens, top_k,
+            dW, X, GRAD, SORTED, BLOCK_START, BLOCKS_PER_EXPERT, ROUTE_START,
+            N, K, num_recv_tokens,
         ).launch(grid=(gx, gy, gz), block=(n_threads, 1, 1), stream=stream)
 
     return launch_wgrad
@@ -477,13 +502,6 @@ def _ds_read_tr_bf16x4(base_ptr, const_byte=0):
     return fx.Vector(raw, (4,), fx.BFloat16)
 
 
-def _scale_bf16_vec(vec, w_f32):
-    vf = arith.extf(T.vec(FILL_V, T.f32), vec)
-    wv = vector.broadcast(T.vec(FILL_V, T.f32), w_f32)
-    pf = arith.mulf(vf, wv)
-    return arith.truncf(T.vec(FILL_V, T.bf16), pf)
-
-
 def buffer_load_i32(rsrc, off_i32):
     return buffer_ops.buffer_load(rsrc, off_i32, vec_width=1, dtype=T.i32)
 
@@ -494,10 +512,6 @@ def buffer_load_i32_idx(rsrc, off_idx):
 
 def buffer_load_bf16_vec(rsrc, off_idx, v):
     return buffer_ops.buffer_load(rsrc, off_idx, vec_width=v, dtype=T.bf16)
-
-
-def buffer_load_f32(rsrc, off_idx):
-    return buffer_ops.buffer_load(rsrc, off_idx, vec_width=1, dtype=T.f32)
 
 
 def buffer_store_bf16(rsrc, off_idx, val):
