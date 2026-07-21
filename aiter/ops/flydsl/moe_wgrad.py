@@ -19,6 +19,19 @@ from .kernels.tensor_shim import ptr_arg, _run_compiled
 __all__ = ["flydsl_moe_wgrad", "flydsl_moe_wgrad_autotuned", "WGRAD_BLOCK_M"]
 
 
+def _resolve_out_dtype(dw: torch.Tensor, out_dtype):
+    """Pick the kernel ``out_dtype`` ('bf16'/'fp32') and validate it against ``dw``."""
+    if out_dtype is None:
+        out_dtype = "fp32" if dw.dtype == torch.float32 else "bf16"
+    if out_dtype == "fp32":
+        assert dw.dtype == torch.float32, "out_dtype='fp32' requires a float32 dw buffer"
+    elif out_dtype == "bf16":
+        assert dw.dtype == torch.bfloat16, "out_dtype='bf16' requires a bfloat16 dw buffer"
+    else:
+        raise ValueError(f"out_dtype must be 'bf16' or 'fp32', got {out_dtype!r}")
+    return out_dtype
+
+
 def flydsl_moe_wgrad(
     x: torch.Tensor,
     grad: torch.Tensor,
@@ -33,8 +46,10 @@ def flydsl_moe_wgrad(
     block_k: int = 128,
     warps_n: int = 2,
     warps_k: int = 2,
+    accumulate: bool = False,
+    out_dtype: str | None = None,
 ) -> None:
-    """Compute ``dw[e] += grad[route]^T @ x[token(route)]`` grouped by expert, in place.
+    """Compute the grouped wgrad ``grad[route]^T @ x[token(route)]`` into ``dw``, per expert.
 
     See ``fused_route_list_moe_wgrad`` for the argument contract: ``x`` is
     ``[num_recv_tokens, K]`` (gathered by received-token row), ``grad`` is the compact
@@ -44,11 +59,20 @@ def flydsl_moe_wgrad(
 
     ``block_n``/``block_k`` and ``warps_n``/``warps_k`` select the workgroup tile; the
     defaults (``128x128`` over ``2x2`` warps) are a strong general config on CDNA4.
+
+    Output modes (each dW element is written by exactly one workgroup, so accumulation is a
+    race-free read-modify-write -- no atomics):
+      * ``accumulate=False`` (default): overwrite ``dw`` (``dw[e] = grad^T @ x``).
+      * ``accumulate=True``: add into ``dw`` (``dw[e] += grad^T @ x``) -- lets the caller
+        fold wgrad straight into a param's ``main_grad`` / ``.grad`` without a separate add.
+    ``out_dtype`` ('bf16' or 'fp32', inferred from ``dw`` when ``None``) picks the store
+    precision, so an fp32 ``main_grad`` accumulator can be targeted directly.
     """
     num_experts, N, K = dw.shape
 
-    assert x.dtype == grad.dtype == dw.dtype == torch.bfloat16
+    assert x.dtype == grad.dtype == torch.bfloat16
     assert x.is_contiguous() and grad.is_contiguous() and dw.is_contiguous()
+    out_dtype = _resolve_out_dtype(dw, out_dtype)
 
     exe = compile_moe_wgrad_v2(
         dtype="bf16",
@@ -56,6 +80,8 @@ def flydsl_moe_wgrad(
         block_k=int(block_k),
         warps_n=int(warps_n),
         warps_k=int(warps_k),
+        accumulate=bool(accumulate),
+        out_dtype=out_dtype,
     )
 
     _run_compiled(
@@ -156,6 +182,30 @@ def _get_autotuner(warmup=10, rep=30):
     return _wgrad_autotuner
 
 
+def _select_wgrad_config(
+    x, grad, sorted_slot_ids, block_start, blocks_per_expert, route_start,
+    N, K, num_recv_tokens, num_experts,
+):
+    """Return the autotuned ``(block_n, block_k, warps_n, warps_k)`` for this problem.
+
+    Tuning benchmarks the plain *overwrite* bf16 kernel into a throwaway scratch buffer, so
+    it never touches (and never zeroes) a real accumulation target. The tile choice is
+    independent of the epilogue's accumulate/out_dtype, so the same cached config drives the
+    accumulate/fp32 launch. Reuses the shared on-disk cache keyed on ``(x.shape, N, E)``.
+    """
+    tuner = _get_autotuner()
+    scratch = torch.empty(num_experts, N, K, device=x.device, dtype=torch.bfloat16)
+    args = (
+        scratch, x, grad, sorted_slot_ids, block_start, blocks_per_expert, route_start,
+        int(N), int(K), int(num_recv_tokens), int(num_experts),
+    )
+    key = tuner._make_key(args, {})
+    if key not in tuner.cache:
+        tuner(*args)  # one-time benchmark into scratch, populates the cache
+    cfg = tuner.cache[key].kwargs
+    return cfg["block_n"], cfg["block_k"], cfg["warps_n"], cfg["warps_k"]
+
+
 def flydsl_moe_wgrad_autotuned(
     x: torch.Tensor,
     grad: torch.Tensor,
@@ -166,30 +216,61 @@ def flydsl_moe_wgrad_autotuned(
     route_start: torch.Tensor,
     *,
     num_recv_tokens: int,
+    accumulate: bool = False,
+    out_dtype: str | None = None,
 ) -> None:
     """Shape-autotuned variant of :func:`flydsl_moe_wgrad`.
 
     First call for a given ``(x.shape, N, num_experts)`` benchmarks every tile in
     ``_AUTOTUNE_TILES`` and caches the fastest (in-memory + on disk under
-    ``~/.flydsl/autotune/``); later calls reuse it with no benchmarking overhead. The
-    wgrad launch is idempotent for a fixed input, so no ``reset_to_zero`` is needed and
-    the benchmark timing stays free of memset noise.
+    ``~/.flydsl/autotune/``); later calls reuse it with no benchmarking overhead.
+
+    ``accumulate``/``out_dtype`` are forwarded to the kernel epilogue (see
+    :func:`flydsl_moe_wgrad`). For the plain overwrite-bf16 case the autotuner both benchmarks
+    and launches directly into ``dw`` (idempotent, no ``reset_to_zero`` needed). For the
+    accumulate/fp32 case the tile is selected on a scratch buffer and the chosen config is then
+    launched with the accumulate epilogue into ``dw`` -- so tuning never corrupts the real
+    accumulation target.
     """
     num_experts, N, K = dw.shape
 
-    assert x.dtype == grad.dtype == dw.dtype == torch.bfloat16
+    assert x.dtype == grad.dtype == torch.bfloat16
     assert x.is_contiguous() and grad.is_contiguous() and dw.is_contiguous()
+    out_dtype = _resolve_out_dtype(dw, out_dtype)
 
-    _get_autotuner()(
-        dw,
+    if not accumulate and out_dtype == "bf16":
+        _get_autotuner()(
+            dw,
+            x,
+            grad,
+            sorted_slot_ids,
+            block_start,
+            blocks_per_expert,
+            route_start,
+            int(N),
+            int(K),
+            int(num_recv_tokens),
+            int(num_experts),
+        )
+        return
+
+    block_n, block_k, warps_n, warps_k = _select_wgrad_config(
+        x, grad, sorted_slot_ids, block_start, blocks_per_expert, route_start,
+        N, K, num_recv_tokens, num_experts,
+    )
+    flydsl_moe_wgrad(
         x,
         grad,
+        dw,
         sorted_slot_ids,
         block_start,
         blocks_per_expert,
         route_start,
-        int(N),
-        int(K),
-        int(num_recv_tokens),
-        int(num_experts),
+        num_recv_tokens=int(num_recv_tokens),
+        block_n=block_n,
+        block_k=block_k,
+        warps_n=warps_n,
+        warps_k=warps_k,
+        accumulate=accumulate,
+        out_dtype=out_dtype,
     )

@@ -84,9 +84,13 @@ def compile_moe_wgrad_v2(
     block_k: int = 64,
     warps_n: int = 1,
     warps_k: int = 1,
+    accumulate: bool = False,
+    out_dtype: str = "bf16",
 ):
     if dtype != "bf16":
         raise ValueError(f"moe_wgrad v2 flydsl kernel only supports bf16, got {dtype!r}")
+    if out_dtype not in ("bf16", "fp32"):
+        raise ValueError(f"moe_wgrad v2 out_dtype must be 'bf16' or 'fp32', got {out_dtype!r}")
     if block_n % (warps_n * WMMA_M) != 0 or block_k % (warps_k * WMMA_N) != 0:
         raise ValueError("block_n/block_k must be multiples of warps_*16")
 
@@ -111,10 +115,12 @@ def compile_moe_wgrad_v2(
     G_FILLS = (WGRAD_BLOCK_M * block_n) // (n_threads * FILL_V)
     X_FILLS = (WGRAD_BLOCK_M * block_k) // (n_threads * FILL_V)
 
+    out_is_f32 = out_dtype == "fp32"
     KERNEL_NAME = (
         f"moe_wgrad_routelist_{dtype}"
         f"_{block_n}x{block_k}_w{warps_n}x{warps_k}"
-        f"_p{LDS_PAD}_v2"
+        f"_p{LDS_PAD}"
+        f"{'_o32' if out_is_f32 else ''}{'_acc' if accumulate else ''}_v2"
     )
 
     # LDS allocation: double-buffered grad tile + x tile (2 bytes/bf16, 2 buffers each).
@@ -126,7 +132,7 @@ def compile_moe_wgrad_v2(
 
     @flyc.kernel(known_block_size=[n_threads, 1, 1])
     def wgrad_kernel(
-        dW: fx.Pointer,          # [E, N, K] bf16 output
+        dW: fx.Pointer,          # [E, N, K] output (bf16, or fp32 when out_dtype='fp32')
         X: fx.Pointer,           # [num_recv_tokens, K] bf16 (received-token activations)
         GRAD: fx.Pointer,        # [num_routes, N] bf16 (compact per-route gradient)
         SORTED: fx.Pointer,      # [padded] i32 received-token row per route slot (sentinel = num_recv_tokens)
@@ -395,7 +401,12 @@ def compile_moe_wgrad_v2(
 
         accs = [loop.results[i] for i in range(NACC)]
 
-        # Epilogue: C[m=n_feat, n=k_feat], lane holds 4 rows.
+        # Epilogue: C[m=n_feat, n=k_feat], lane holds 4 rows. Each dW element is owned by
+        # exactly one workgroup (grid = N x K x E over disjoint output tiles), so when
+        # ``accumulate`` is set the read-modify-write into the destination is race-free (no
+        # atomics needed) -- this lets the caller fold the wgrad straight into ``main_grad`` /
+        # ``.grad`` instead of materializing a scratch dW and doing a separate add/copy.
+        out_ty = T.f32 if out_is_f32 else bf16
         E_NK_row = arith.index_cast(T.index, expert) * N_idx * K_idx
         for mi in range_constexpr(M_STEPS):
             for nj in range_constexpr(N_STEPS):
@@ -416,9 +427,16 @@ def compile_moe_wgrad_v2(
                     with ir.InsertionPoint(store_if.then_block):
                         val = vector.extract(
                             acc, static_position=[ii], dynamic_position=[]
-                        )
+                        )  # f32 accumulator
                         out_off = E_NK_row + n_out_idx * K_idx + c_n_idx
-                        buffer_store_bf16(dW_rsrc, out_off, arith.truncf(bf16, val))
+                        if const_expr(accumulate):
+                            prev = buffer_ops.buffer_load(
+                                dW_rsrc, out_off, vec_width=1, dtype=out_ty
+                            )
+                            prev_f32 = prev if const_expr(out_is_f32) else arith.extf(T.f32, prev)
+                            val = arith.addf(val, prev_f32)
+                        store_val = val if const_expr(out_is_f32) else arith.truncf(bf16, val)
+                        buffer_ops.buffer_store(store_val, dW_rsrc, out_off)
                         scf.YieldOp([])
 
     @flyc.jit
