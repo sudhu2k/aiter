@@ -86,6 +86,7 @@ def compile_moe_wgrad_v2(
     warps_k: int = 1,
     accumulate: bool = False,
     out_dtype: str = "bf16",
+    swap_gather: bool = False,
 ):
     if dtype != "bf16":
         raise ValueError(f"moe_wgrad v2 flydsl kernel only supports bf16, got {dtype!r}")
@@ -120,7 +121,8 @@ def compile_moe_wgrad_v2(
         f"moe_wgrad_routelist_{dtype}"
         f"_{block_n}x{block_k}_w{warps_n}x{warps_k}"
         f"_p{LDS_PAD}"
-        f"{'_o32' if out_is_f32 else ''}{'_acc' if accumulate else ''}_v2"
+        f"{'_o32' if out_is_f32 else ''}{'_acc' if accumulate else ''}"
+        f"{'_swp' if swap_gather else ''}_v2"
     )
 
     # LDS allocation: double-buffered grad tile + x tile (2 bytes/bf16, 2 buffers each).
@@ -254,7 +256,12 @@ def compile_moe_wgrad_v2(
                 valid = arith.andi(
                     in_range, arith.cmpi(arith.CmpIPredicate.ult, token, nrecv_idx)
                 )
-                grad_row = route_start_e_idx + slot_base_idx + slot_idx
+                # Row source for the N-operand: default (FC1) is a contiguous route walk into a
+                # compact ``[num_routes, N]`` grad; ``swap_gather`` (FC2) instead token-gathers a
+                # ``[num_recv, N]`` buffer via ``SORTED`` (so the N feature = the gathered
+                # operand's), letting the wgrad emit its natural transpose without a post-pass.
+                route_row = route_start_e_idx + slot_base_idx + slot_idx
+                grad_row = token if const_expr(swap_gather) else route_row
                 goff = valid.select(grad_row, c0) * N_idx + n_base_idx + feat_idx
                 gvec = buffer_load_bf16_vec(grad_rsrc, goff, FILL_V)
                 raw.append((gvec, valid, None))
@@ -274,7 +281,12 @@ def compile_moe_wgrad_v2(
                 valid = arith.andi(
                     in_range, arith.cmpi(arith.CmpIPredicate.ult, token, nrecv_idx)
                 )
-                xoff = valid.select(token, c0) * K_idx + k_base_idx + feat_idx
+                # Row source for the K-operand: default (FC1) token-gathers a ``[num_recv, K]``
+                # buffer via ``SORTED``; ``swap_gather`` (FC2) instead reads a compact
+                # ``[num_routes, K]`` buffer by route position (the gather moves to the N-operand).
+                route_row = route_start_e_idx + slot_base_idx + slot_idx
+                x_row = route_row if const_expr(swap_gather) else token
+                xoff = valid.select(x_row, c0) * K_idx + k_base_idx + feat_idx
                 xvec = buffer_load_bf16_vec(x_rsrc, xoff, FILL_V)
                 raw.append((xvec, valid, None))
             return raw

@@ -48,6 +48,7 @@ def flydsl_moe_wgrad(
     warps_k: int = 2,
     accumulate: bool = False,
     out_dtype: str | None = None,
+    swap_gather: bool = False,
 ) -> None:
     """Compute the grouped wgrad ``grad[route]^T @ x[token(route)]`` into ``dw``, per expert.
 
@@ -67,6 +68,12 @@ def flydsl_moe_wgrad(
         fold wgrad straight into a param's ``main_grad`` / ``.grad`` without a separate add.
     ``out_dtype`` ('bf16' or 'fp32', inferred from ``dw`` when ``None``) picks the store
     precision, so an fp32 ``main_grad`` accumulator can be targeted directly.
+
+    ``swap_gather`` moves the ``SORTED`` token-gather from the ``x`` (K) operand to the ``grad``
+    (N) operand: ``x`` is then read by route position from a compact ``[num_routes, K]`` buffer
+    and ``grad`` is token-gathered from a ``[num_recv, N]`` buffer. This is the FC2 wgrad case --
+    passing ``x=fc2_input`` (route-ordered) and ``grad=grad_output`` (token-space) makes the
+    kernel emit ``dW2`` in ``[E, out, in]`` directly, with no transpose post-pass.
     """
     num_experts, N, K = dw.shape
 
@@ -82,6 +89,7 @@ def flydsl_moe_wgrad(
         warps_k=int(warps_k),
         accumulate=bool(accumulate),
         out_dtype=out_dtype,
+        swap_gather=bool(swap_gather),
     )
 
     _run_compiled(
@@ -218,6 +226,7 @@ def flydsl_moe_wgrad_autotuned(
     num_recv_tokens: int,
     accumulate: bool = False,
     out_dtype: str | None = None,
+    swap_gather: bool = False,
 ) -> None:
     """Shape-autotuned variant of :func:`flydsl_moe_wgrad`.
 
@@ -225,12 +234,12 @@ def flydsl_moe_wgrad_autotuned(
     ``_AUTOTUNE_TILES`` and caches the fastest (in-memory + on disk under
     ``~/.flydsl/autotune/``); later calls reuse it with no benchmarking overhead.
 
-    ``accumulate``/``out_dtype`` are forwarded to the kernel epilogue (see
-    :func:`flydsl_moe_wgrad`). For the plain overwrite-bf16 case the autotuner both benchmarks
-    and launches directly into ``dw`` (idempotent, no ``reset_to_zero`` needed). For the
-    accumulate/fp32 case the tile is selected on a scratch buffer and the chosen config is then
-    launched with the accumulate epilogue into ``dw`` -- so tuning never corrupts the real
-    accumulation target.
+    ``accumulate``/``out_dtype``/``swap_gather`` are forwarded to the kernel (see
+    :func:`flydsl_moe_wgrad`). For the plain overwrite-bf16, non-swap case the autotuner both
+    benchmarks and launches directly into ``dw`` (idempotent, no ``reset_to_zero`` needed).
+    Otherwise the tile is selected on a scratch buffer and the chosen config is launched with the
+    requested epilogue into ``dw`` -- so tuning never corrupts the real accumulation target. The
+    tile geometry is independent of the epilogue/gather mode, so the shared cache is reused.
     """
     num_experts, N, K = dw.shape
 
@@ -238,7 +247,7 @@ def flydsl_moe_wgrad_autotuned(
     assert x.is_contiguous() and grad.is_contiguous() and dw.is_contiguous()
     out_dtype = _resolve_out_dtype(dw, out_dtype)
 
-    if not accumulate and out_dtype == "bf16":
+    if not accumulate and out_dtype == "bf16" and not swap_gather:
         _get_autotuner()(
             dw,
             x,
@@ -273,4 +282,5 @@ def flydsl_moe_wgrad_autotuned(
         warps_k=warps_k,
         accumulate=accumulate,
         out_dtype=out_dtype,
+        swap_gather=swap_gather,
     )
