@@ -50,6 +50,7 @@ from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, ptrtoint, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
@@ -94,6 +95,7 @@ def compile_moe_wgrad_v2(
     swap_gather: bool = False,
     dma_swizzle: bool = False,
     pipe_stages: int = 2,
+    agpr_accumulators: bool = False,
 ):
     if dtype != "bf16":
         raise ValueError(f"moe_wgrad v2 flydsl kernel only supports bf16, got {dtype!r}")
@@ -101,12 +103,15 @@ def compile_moe_wgrad_v2(
         raise ValueError(f"moe_wgrad v2 out_dtype must be 'bf16' or 'fp32', got {out_dtype!r}")
     if block_n % (warps_n * WMMA_M) != 0 or block_k % (warps_k * WMMA_N) != 0:
         raise ValueError("block_n/block_k must be multiples of warps_*16")
-    if dma_swizzle and swap_gather:
-        raise ValueError("moe_wgrad v2 dma_swizzle does not support swap_gather yet")
     if pipe_stages < 2:
         raise ValueError("moe_wgrad v2 pipe_stages must be >= 2")
     if pipe_stages > 2 and not dma_swizzle:
         raise ValueError("moe_wgrad v2 pipe_stages > 2 requires dma_swizzle")
+    if agpr_accumulators:
+        if not dma_swizzle:
+            raise ValueError("moe_wgrad v2 agpr_accumulators requires dma_swizzle")
+        if (warps_n, warps_k) != (2, 2):
+            raise ValueError("moe_wgrad v2 agpr_accumulators only supports w2x2")
     # Number of LDS ping-pong buffers = pipeline depth; prefetch distance = NUM_BUF - 1.
     # Deeper pipelines give each in-flight DMA more MFMA iterations to hide behind (the
     # HK 4-wave recipe), at the cost of NUM_BUF x the LDS footprint.
@@ -124,6 +129,10 @@ def compile_moe_wgrad_v2(
     M_STEPS = WN // WMMA_M           # grad-feature atoms per warp (MFMA-M)
     N_STEPS = WK // WMMA_N           # x-feature atoms   per warp (MFMA-N)
     NACC = M_STEPS * N_STEPS
+    if agpr_accumulators and NACC * C_FRAG > 256:
+        raise ValueError(
+            "moe_wgrad v2 agpr_accumulators exceeds the 256-AGPR accumulator bank"
+        )
 
     # DMA fill writes each lane's 16B contiguously into LDS (no per-row pad possible),
     # so the swizzle path uses an un-padded stride and breaks bank conflicts with an
@@ -147,7 +156,8 @@ def compile_moe_wgrad_v2(
         f"_p{LDS_PAD}"
         f"{'_o32' if out_is_f32 else ''}{'_acc' if accumulate else ''}"
         f"{'_swp' if swap_gather else ''}{'_dsz' if dma_swizzle else ''}"
-        f"{'_s' + str(pipe_stages) if pipe_stages != 2 else ''}_v2"
+        f"{'_s' + str(pipe_stages) if pipe_stages != 2 else ''}"
+        f"{'_agpr' if agpr_accumulators else ''}_v2"
     )
 
     # LDS allocation: NUM_BUF-buffered grad tile + x tile (2 bytes/bf16). The non-DMA
@@ -215,21 +225,114 @@ def compile_moe_wgrad_v2(
         warp_n_base = wn_id * fx.Int32(WN)     # grad-feature col base of this warp
         warp_k_base = wk_id * fx.Int32(WK)     # x-feature col base of this warp
 
+        # The pinned w2x2 path keeps its f32x4 output fragments in a fixed prefix of
+        # a[0:255] for the complete slot loop, rather than carrying vector SSA values
+        # through scf.for. This is the same physical-AGPR mechanism used by
+        # flydsl_4wave_hk.py; all other configurations retain compiler-managed MFMA
+        # accumulators.
+        PIN_ACC_BASE = 0
+
+        def _reg_list(prefix, start, end):
+            return ",".join(f"~{{{prefix}{reg}}}" for reg in range(start, end + 1))
+
+        def _unwrap_once(value):
+            for attr in ("result", "res", "ir_value", "mlir_value", "_value", "_ir_value",
+                         "_mlir_value"):
+                if hasattr(value, attr):
+                    candidate = getattr(value, attr)
+                    if callable(candidate):
+                        try:
+                            candidate = candidate()
+                        except TypeError:
+                            candidate = value
+                    if candidate is not value:
+                        return candidate
+            if hasattr(value, "results") and len(value.results) == 1:
+                return value.results[0]
+            return value
+
+        def _unwrap_mlir_value(value):
+            for _ in range_constexpr(4):
+                value = _unwrap_once(value)
+            return value
+
+        def _inline_asm_i32(asm_string, constraints):
+            op = _llvm.InlineAsmOp(
+                T.i32, [], asm_string, constraints, has_side_effects=True
+            )
+            return getattr(op, "result", getattr(op, "res", op.results[0]))
+
+        def reserve_pinned_accumulators():
+            _llvm.InlineAsmOp(
+                None,
+                [],
+                "",
+                _reg_list("a", PIN_ACC_BASE, PIN_ACC_BASE + NACC * C_FRAG - 1),
+                has_side_effects=True,
+            )
+
+        def zero_pinned_accumulators():
+            for ai in range_constexpr(NACC * C_FRAG):
+                _llvm.InlineAsmOp(
+                    None,
+                    [],
+                    f"v_accvgpr_write_b32 a[{PIN_ACC_BASE + ai}], 0",
+                    f"~{{a{PIN_ACC_BASE + ai}}}",
+                    has_side_effects=True,
+                )
+
+        def pinned_mfma(acc_idx, a_frag, b_frag):
+            acc_pin = PIN_ACC_BASE + acc_idx * C_FRAG
+            _llvm.InlineAsmOp(
+                None,
+                [_unwrap_mlir_value(a_frag), _unwrap_mlir_value(b_frag)],
+                (
+                    f"v_mfma_f32_16x16x32_bf16 "
+                    f"a[{acc_pin}:{acc_pin + C_FRAG - 1}], $0, $1, "
+                    f"a[{acc_pin}:{acc_pin + C_FRAG - 1}]"
+                ),
+                (
+                    "v,v,"
+                    f"~{{a{acc_pin}}},~{{a{acc_pin + 1}}},"
+                    f"~{{a{acc_pin + 2}}},~{{a{acc_pin + 3}}}"
+                ),
+                has_side_effects=True,
+            )
+
+        def read_pinned_accumulator(acc_idx):
+            acc_pin = PIN_ACC_BASE + acc_idx * C_FRAG
+            values = [
+                _inline_asm_i32(
+                    f"v_accvgpr_read_b32 $0, a[{acc_pin + elem}]", "=v"
+                )
+                for elem in range_constexpr(C_FRAG)
+            ]
+            return Vec.from_elements(values, fx.Int32).bitcast(fx.Float32)
+
         N_idx = arith.index_cast(T.index, N)
         K_idx = arith.index_cast(T.index, K)
         nrecv_idx = arith.index_cast(T.index, num_recv_tokens)
 
-        # DMA fill cannot mask padding slots in registers, so bound the x resource to its
-        # real [num_recv, K] extent: the sentinel token (== num_recv) and any pipeline
-        # overrun then read out-of-bounds -> hardware returns 0. A zeroed x column makes
-        # the padding slot's outer product ``grad (x) 0 == 0``, so the (unbounded) grad
-        # operand may safely read garbage for those slots.
+        # DMA fill cannot mask padding slots in registers, so bound the *token-gathered*
+        # operand's resource to its real [num_recv, feat] extent: the sentinel token
+        # (== num_recv) and any pipeline overrun then read out-of-bounds -> hardware
+        # returns 0. A zeroed gathered column makes the padding slot's outer product
+        # ``other (x) 0 == 0``, so the paired contiguous-walk operand may safely read
+        # garbage (clamped to row 0) for those slots. The gathered operand is ``x``
+        # ([num_recv, K]) for FC1, or ``grad`` ([num_recv, N]) for FC2 (``swap_gather``).
         if const_expr(dma_swizzle):
-            x_addr_i64 = arith.index_cast(T.i64, ptrtoint(X))
-            x_nrec_bytes = nrecv_idx * K_idx * arith.index(2)
-            x_rsrc = buffer_ops.create_buffer_resource_from_addr(
-                x_addr_i64, num_records_bytes=x_nrec_bytes
-            )
+            if const_expr(swap_gather):
+                grad_addr_i64 = arith.index_cast(T.i64, ptrtoint(GRAD))
+                grad_nrec_bytes = nrecv_idx * N_idx * arith.index(2)
+                grad_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    grad_addr_i64, num_records_bytes=grad_nrec_bytes
+                )
+            else:
+                x_addr_i64 = arith.index_cast(T.i64, ptrtoint(X))
+                x_nrec_bytes = nrecv_idx * K_idx * arith.index(2)
+                x_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    x_addr_i64, num_records_bytes=x_nrec_bytes
+                )
 
         n_block_base = n_tile * block_n
         k_block_base = k_tile * block_k
@@ -398,10 +501,13 @@ def compile_moe_wgrad_v2(
                 )
 
         def dma_fill(g_ids, x_ids, slot_base_idx, g_buf_byte, x_buf_byte):
+            # The token-gathered operand walks by SORTED token (clamp_row=False, OOB->0 via
+            # its bounded resource); its contiguous route-walk partner uses clamp_row=True.
+            # FC1 gathers ``x``; FC2 (swap_gather) gathers ``grad`` instead.
             _dma_one(grad_rsrc, g_ids, slot_base_idx, CPR_G_SWZ, n_base_idx, N_idx,
-                     g_lds_off, g_buf_byte, G_FILLS, clamp_row=True)
+                     g_lds_off, g_buf_byte, G_FILLS, clamp_row=const_expr(not swap_gather))
             _dma_one(x_rsrc, x_ids, slot_base_idx, CPR_X_SWZ, k_base_idx, K_idx,
-                     x_lds_off, x_buf_byte, X_FILLS, clamp_row=False)
+                     x_lds_off, x_buf_byte, X_FILLS, clamp_row=const_expr(swap_gather))
 
         def _dma_barrier(keep=0):
             # DMA lands on vmcnt (global load); drain it before the workgroup barrier so
@@ -446,7 +552,7 @@ def compile_moe_wgrad_v2(
                     lane_m_base, tr_k_group, tr_col_sub, x_buf_byte,
                 )
 
-            new_accs = [None] * NACC
+            new_accs = [] if const_expr(agpr_accumulators) else [None] * NACC
             b_frags = [None] * N_STEPS
 
             if const_expr(dma_prefetch is not None):
@@ -469,10 +575,13 @@ def compile_moe_wgrad_v2(
                 for mi in range_constexpr(M_STEPS):
                     for nj in range_constexpr(N_STEPS):
                         idx = mi * N_STEPS + nj
-                        new_accs[idx] = rocdl.mfma_f32_16x16x32_bf16(
-                            T.vec(C_FRAG, T.f32),
-                            [a_frags[mi], b_frags[nj], accs[idx], 0, 0, 0],
-                        )
+                        if const_expr(agpr_accumulators):
+                            pinned_mfma(idx, a_frags[mi], b_frags[nj])
+                        else:
+                            new_accs[idx] = rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(C_FRAG, T.f32),
+                                [a_frags[mi], b_frags[nj], accs[idx], 0, 0, 0],
+                            )
                     rocdl.sched_barrier(0)
                 rocdl.s_setprio(0)
                 return new_accs
@@ -491,9 +600,12 @@ def compile_moe_wgrad_v2(
                     if const_expr(mi == 0 and nj + 1 < N_STEPS):
                         b_frags[nj + 1] = read_b(nj + 1)
                     idx = mi * N_STEPS + nj
-                    new_accs[idx] = rocdl.mfma_f32_16x16x32_bf16(
-                        T.vec(C_FRAG, T.f32), [a_cur, b_frags[nj], accs[idx], 0, 0, 0]
-                    )
+                    if const_expr(agpr_accumulators):
+                        pinned_mfma(idx, a_cur, b_frags[nj])
+                    else:
+                        new_accs[idx] = rocdl.mfma_f32_16x16x32_bf16(
+                            T.vec(C_FRAG, T.f32), [a_cur, b_frags[nj], accs[idx], 0, 0, 0]
+                        )
                 rocdl.sched_barrier(0)
             rocdl.s_setprio(0)
             return new_accs
@@ -502,7 +614,19 @@ def compile_moe_wgrad_v2(
             # Per-step ping-pong sync
             gpu.barrier()
 
-        acc_init = [arith.constant_vector(0.0, T.vec(C_FRAG, T.f32)) for _ in range(NACC)]
+        if const_expr(agpr_accumulators):
+            # a[0:255] is per-wave state. It survives the scf.for without being
+            # represented as loop-carried SSA, unlike the generic accumulator list.
+            reserve_pinned_accumulators()
+            zero_pinned_accumulators()
+            acc_init = []
+            acc_iter_args = 0
+        else:
+            acc_init = [
+                arith.constant_vector(0.0, T.vec(C_FRAG, T.f32))
+                for _ in range(NACC)
+            ]
+            acc_iter_args = NACC
         step = arith.index(WMMA_K)
 
         # When sharing slot ids (block_n == block_k), only the grad ids are carried through
@@ -545,9 +669,15 @@ def compile_moe_wgrad_v2(
         )
         with ir.InsertionPoint(loop.body):
             s_base = loop.induction_variable
-            accs = [loop.body.arguments[1 + i] for i in range(NACC)]
-            g_ids = [loop.body.arguments[1 + NACC + i] for i in range(G_FILLS)]
-            x_ids = [loop.body.arguments[1 + NACC + G_FILLS + i] for i in range(X_FILLS)]
+            if const_expr(agpr_accumulators):
+                accs = []
+            else:
+                accs = [loop.body.arguments[1 + i] for i in range(NACC)]
+            g_ids = [loop.body.arguments[1 + acc_iter_args + i] for i in range(G_FILLS)]
+            x_ids = [
+                loop.body.arguments[1 + acc_iter_args + G_FILLS + i]
+                for i in range(X_FILLS)
+            ]
 
             it = fx.Int32(arith.index_cast(T.i32, s_base)) // fx.Int32(WMMA_K)
 
@@ -607,7 +737,10 @@ def compile_moe_wgrad_v2(
                 _barrier()
                 scf.YieldOp(new_accs + _pack_ids(g_ids_nxt, x_ids_nxt))
 
-        accs = [loop.results[i] for i in range(NACC)]
+        if const_expr(agpr_accumulators):
+            accs = []
+        else:
+            accs = [loop.results[i] for i in range(NACC)]
 
         # Epilogue: C[m=n_feat, n=k_feat], lane holds 4 rows. Each dW element is owned by
         # exactly one workgroup (grid = N x K x E over disjoint output tiles), so when
@@ -618,7 +751,12 @@ def compile_moe_wgrad_v2(
         E_NK_row = arith.index_cast(T.index, expert) * N_idx * K_idx
         for mi in range_constexpr(M_STEPS):
             for nj in range_constexpr(N_STEPS):
-                acc = accs[mi * N_STEPS + nj]
+                acc_idx = mi * N_STEPS + nj
+                acc = (
+                    read_pinned_accumulator(acc_idx)
+                    if const_expr(agpr_accumulators)
+                    else accs[acc_idx]
+                )
                 c_n = k_block_base + warp_k_base + fx.Int32(nj * WMMA_N) + lane_n
                 c_n_idx = arith.index_cast(T.index, c_n)
                 k_ok = arith.cmpi(arith.CmpIPredicate.ult, c_n_idx, K_idx)

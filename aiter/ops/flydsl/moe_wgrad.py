@@ -48,11 +48,12 @@ _WGRAD_SPREAD_DMA = _env_flag("AITER_WGRAD_SPREAD_DMA", True)
 def _resolve_dma_opts(swap_gather: bool):
     """Resolve the (dma_swizzle, pipe_stages, spread_dma) triple from env defaults.
 
-    ``dma_swizzle`` does not yet support ``swap_gather`` (FC2), so it is force-disabled
-    there; the dependent knobs (``pipe_stages`` > 2, ``spread_dma``) collapse to their
-    ping-pong-safe values whenever DMA is off so the kernel never hits an invalid combo.
+    The DMA+swizzle fill supports both FC1 and FC2 (``swap_gather``): the token-gathered
+    operand simply moves from ``x`` to ``grad``. The dependent knobs (``pipe_stages`` > 2,
+    ``spread_dma``) collapse to their ping-pong-safe values whenever DMA is off so the
+    kernel never hits an invalid combo.
     """
-    dma = _WGRAD_DMA_SWIZZLE and not swap_gather
+    dma = _WGRAD_DMA_SWIZZLE
     stages = _WGRAD_PIPE_STAGES if dma else 2
     spread = _WGRAD_SPREAD_DMA if dma else False
     return dma, stages, spread
