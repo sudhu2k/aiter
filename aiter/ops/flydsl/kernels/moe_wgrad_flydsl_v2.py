@@ -48,7 +48,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, ptrtoint, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -73,6 +73,11 @@ FILL_V = 8
 # Overridable via env for sweeps; default chosen from the LDS_PAD ATT sweep.
 LDS_PAD = int(os.environ.get("MOE_WGRAD_LDS_PAD", "8"))
 
+# Debug toggle: when 0, the DMA path uses an identity (no-op) chunk swizzle so the LDS
+# tile is contiguous but un-permuted -- lets us isolate DMA-fill correctness from the
+# XOR-swizzle correctness. Default 1 (swizzle on).
+_DMA_SWZ_ON = int(os.environ.get("MOE_WGRAD_DMA_SWZ", "1"))
+
 WGRAD_BLOCK_M = 32  # contraction (slot) step; matches the align block_size
 
 
@@ -87,6 +92,8 @@ def compile_moe_wgrad_v2(
     accumulate: bool = False,
     out_dtype: str = "bf16",
     swap_gather: bool = False,
+    dma_swizzle: bool = False,
+    pipe_stages: int = 2,
 ):
     if dtype != "bf16":
         raise ValueError(f"moe_wgrad v2 flydsl kernel only supports bf16, got {dtype!r}")
@@ -94,6 +101,16 @@ def compile_moe_wgrad_v2(
         raise ValueError(f"moe_wgrad v2 out_dtype must be 'bf16' or 'fp32', got {out_dtype!r}")
     if block_n % (warps_n * WMMA_M) != 0 or block_k % (warps_k * WMMA_N) != 0:
         raise ValueError("block_n/block_k must be multiples of warps_*16")
+    if dma_swizzle and swap_gather:
+        raise ValueError("moe_wgrad v2 dma_swizzle does not support swap_gather yet")
+    if pipe_stages < 2:
+        raise ValueError("moe_wgrad v2 pipe_stages must be >= 2")
+    if pipe_stages > 2 and not dma_swizzle:
+        raise ValueError("moe_wgrad v2 pipe_stages > 2 requires dma_swizzle")
+    # Number of LDS ping-pong buffers = pipeline depth; prefetch distance = NUM_BUF - 1.
+    # Deeper pipelines give each in-flight DMA more MFMA iterations to hide behind (the
+    # HK 4-wave recipe), at the cost of NUM_BUF x the LDS footprint.
+    NUM_BUF = pipe_stages
 
     n_threads = warps_n * warps_k * WARP_SIZE
     if (WGRAD_BLOCK_M * block_n) % (n_threads * FILL_V) != 0:
@@ -108,8 +125,15 @@ def compile_moe_wgrad_v2(
     N_STEPS = WK // WMMA_N           # x-feature atoms   per warp (MFMA-N)
     NACC = M_STEPS * N_STEPS
 
-    SG = block_n + LDS_PAD           # grad LDS row stride (bf16 elems)
-    SX = block_k + LDS_PAD           # x LDS row stride
+    # DMA fill writes each lane's 16B contiguously into LDS (no per-row pad possible),
+    # so the swizzle path uses an un-padded stride and breaks bank conflicts with an
+    # XOR chunk-swizzle instead (see _swz_chunk / the fill + transpose-read below).
+    SG = block_n if dma_swizzle else block_n + LDS_PAD   # grad LDS row stride (bf16 elems)
+    SX = block_k if dma_swizzle else block_k + LDS_PAD   # x LDS row stride
+    # Swizzle granule = FILL_V bf16 (one 16B DMA unit). ``_swz_chunk`` XORs the feature
+    # chunk index with the slot so consecutive contraction slots land on distinct banks.
+    CPR_G_SWZ = block_n // FILL_V     # feature chunks per grad row
+    CPR_X_SWZ = block_k // FILL_V     # feature chunks per x row
     
     G_TILE_ELEMS = WGRAD_BLOCK_M * SG
     X_TILE_ELEMS = WGRAD_BLOCK_M * SX
@@ -122,15 +146,21 @@ def compile_moe_wgrad_v2(
         f"_{block_n}x{block_k}_w{warps_n}x{warps_k}"
         f"_p{LDS_PAD}"
         f"{'_o32' if out_is_f32 else ''}{'_acc' if accumulate else ''}"
-        f"{'_swp' if swap_gather else ''}_v2"
+        f"{'_swp' if swap_gather else ''}{'_dsz' if dma_swizzle else ''}"
+        f"{'_s' + str(pipe_stages) if pipe_stages != 2 else ''}_v2"
     )
 
-    # LDS allocation: double-buffered grad tile + x tile (2 bytes/bf16, 2 buffers each).
+    # LDS allocation: NUM_BUF-buffered grad tile + x tile (2 bytes/bf16). The non-DMA
+    # path always ping-pongs 2 buffers; the DMA path uses NUM_BUF == pipe_stages.
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
     g_lds_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = g_lds_off + G_TILE_ELEMS * 2 * 2
+    allocator.ptr = g_lds_off + G_TILE_ELEMS * 2 * NUM_BUF
     x_lds_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = x_lds_off + X_TILE_ELEMS * 2 * 2
+    allocator.ptr = x_lds_off + X_TILE_ELEMS * 2 * NUM_BUF
+    # The DMA path backs LDS with a raw llvm addrspace(3) global (buffer_load_lds needs a
+    # real global for M0; the memref allocator does not work). Same offsets/size.
+    LDS_TOTAL_BYTES = allocator._align(allocator.ptr, 128)
+    LDS_SYM = KERNEL_NAME + "_lds"
 
     @flyc.kernel(known_block_size=[n_threads, 1, 1])
     def wgrad_kernel(
@@ -156,11 +186,17 @@ def compile_moe_wgrad_v2(
         bpe_rsrc = ptr_rsrc(BLOCKS_PER_EXPERT)
         rstart_rsrc = ptr_rsrc(ROUTE_START)
 
-        base_ptr = allocator.get_base()
-        g_lds_ptr = SmemPtr(base_ptr, g_lds_off, bf16, shape=(2 * G_TILE_ELEMS,))
-        x_lds_ptr = SmemPtr(base_ptr, x_lds_off, bf16, shape=(2 * X_TILE_ELEMS,))
-        g_lds = g_lds_ptr.get()
-        x_lds = x_lds_ptr.get()
+        if const_expr(dma_swizzle):
+            # DMA path: raw addrspace(3) global backs LDS; reads + DMA both GEP off it.
+            smem_raw_ptr = _llvm.mlir_addressof(ir.Type.parse("!llvm.ptr<3>"), LDS_SYM)
+            g_lds = None
+            x_lds = None
+        else:
+            base_ptr = allocator.get_base()
+            g_lds_ptr = SmemPtr(base_ptr, g_lds_off, bf16, shape=(2 * G_TILE_ELEMS,))
+            x_lds_ptr = SmemPtr(base_ptr, x_lds_off, bf16, shape=(2 * X_TILE_ELEMS,))
+            g_lds = g_lds_ptr.get()
+            x_lds = x_lds_ptr.get()
 
         tid = fx.Int32(gpu.thread_id("x"))
         n_tile = fx.Int32(gpu.block_id("x"))   # along N (grad feature)
@@ -182,6 +218,18 @@ def compile_moe_wgrad_v2(
         N_idx = arith.index_cast(T.index, N)
         K_idx = arith.index_cast(T.index, K)
         nrecv_idx = arith.index_cast(T.index, num_recv_tokens)
+
+        # DMA fill cannot mask padding slots in registers, so bound the x resource to its
+        # real [num_recv, K] extent: the sentinel token (== num_recv) and any pipeline
+        # overrun then read out-of-bounds -> hardware returns 0. A zeroed x column makes
+        # the padding slot's outer product ``grad (x) 0 == 0``, so the (unbounded) grad
+        # operand may safely read garbage for those slots.
+        if const_expr(dma_swizzle):
+            x_addr_i64 = arith.index_cast(T.i64, ptrtoint(X))
+            x_nrec_bytes = nrecv_idx * K_idx * arith.index(2)
+            x_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                x_addr_i64, num_records_bytes=x_nrec_bytes
+            )
 
         n_block_base = n_tile * block_n
         k_block_base = k_tile * block_k
@@ -309,7 +357,66 @@ def compile_moe_wgrad_v2(
                     [buf_elem + slot_idx * arith.index(SX) + feat_idx], alignment=16,
                 )
 
-        def compute(accs, g_buf_byte, x_buf_byte):
+        def _dma_one(rsrc, ids, slot_base_idx, cpr, feat_base_idx, dim_idx, lds_off,
+                     buf_byte, n_fills, clamp_row):
+            # Issue the global->LDS DMA for one operand: each lane streams FILL_V bf16
+            # from ``global[row, swizzled_feat]`` straight into contiguous LDS (no VGPR
+            # staging). The LDS destination base is wave-uniform (readfirstlane); the
+            # hardware spreads lane L to base + L*16B, reconstructing the contiguous
+            # ``phys_linear * FILL_V`` layout the swizzled transpose read expects.
+            for i in range_constexpr(n_fills):
+                phys = tid + fx.Int32(i * n_threads)
+                slot = phys // fx.Int32(cpr)
+                chunk = phys % fx.Int32(cpr)
+                slot_idx = arith.index_cast(T.index, slot)
+                token = arith.index_cast(T.index, ids[i])
+                in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, slot_base_idx + slot_idx, num_slots
+                )
+                valid = arith.andi(
+                    in_range, arith.cmpi(arith.CmpIPredicate.ult, token, nrecv_idx)
+                )
+                if const_expr(clamp_row):
+                    # grad: contiguous route walk; clamp overrun to row 0 for fault safety
+                    # (its padding contribution is cancelled by the zeroed x column).
+                    row_idx = valid.select(route_start_e_idx + slot_base_idx + slot_idx, c0)
+                else:
+                    # x: gather by received-token; sentinel/OOB row -> hardware 0.
+                    row_idx = token
+                swz = (slot & fx.Int32(cpr - 1)) if _DMA_SWZ_ON else fx.Int32(0)
+                glob_feat = (chunk ^ swz) * fx.Int32(FILL_V)
+                glob_feat_idx = arith.index_cast(T.index, glob_feat)
+                voff_elem = row_idx * dim_idx + feat_base_idx + glob_feat_idx
+                voff_byte = arith.index_cast(T.i32, voff_elem * arith.index(2))
+                lds_perlane = (
+                    fx.Int32(lds_off) + buf_byte + phys * fx.Int32(FILL_V * 2)
+                )
+                lds_base = rocdl.readfirstlane(T.i32, lds_perlane)
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc, _gep_lds(smem_raw_ptr, lds_base), fx.Int32(FILL_V * 2),
+                    voff_byte, fx.Int32(0), fx.Int32(0), fx.Int32(1),
+                )
+
+        def dma_fill(g_ids, x_ids, slot_base_idx, g_buf_byte, x_buf_byte):
+            _dma_one(grad_rsrc, g_ids, slot_base_idx, CPR_G_SWZ, n_base_idx, N_idx,
+                     g_lds_off, g_buf_byte, G_FILLS, clamp_row=True)
+            _dma_one(x_rsrc, x_ids, slot_base_idx, CPR_X_SWZ, k_base_idx, K_idx,
+                     x_lds_off, x_buf_byte, X_FILLS, clamp_row=False)
+
+        def _dma_barrier(keep=0):
+            # DMA lands on vmcnt (global load); drain it before the workgroup barrier so
+            # all waves observe the freshly-staged LDS tile. ``keep`` leaves that many
+            # vmem ops in flight (graduated wait) -- for a >2-stage pipeline this keeps the
+            # just-issued tile's DMA streaming across the barrier so it overlaps the next
+            # iteration's MFMA too (only the tile read next is fully drained). lgkmcnt(0)
+            # retires this wave's ds_reads before the buffer is recycled NUM_BUF steps on.
+            asm = f"s_waitcnt vmcnt({keep}) lgkmcnt(0)\ns_barrier"
+            _llvm.InlineAsmOp(
+                res=None, operands_=[], asm_string=asm,
+                constraints="", has_side_effects=True, is_align_stack=False,
+            )
+
+        def compute(accs, g_buf_byte, x_buf_byte, dma_prefetch=None):
             # A fragments are read one-per-mi to keep VGPR pressure low (hoisting all of
             # them costs occupancy, which the large tile-count shapes depend on). B
             # fragments are loop-invariant across mi, so they are fetched exactly once --
@@ -318,12 +425,22 @@ def compile_moe_wgrad_v2(
             # runs at raised priority so the matrix pipe stays fed while reads are in
             # flight instead of the scheduler round-robining to a stalled wave.
             def read_a(mi):
+                if const_expr(dma_swizzle):
+                    return _tr_read_frag_swz(
+                        smem_raw_ptr, g_lds_off, SG, CPR_G_SWZ, warp_n_base, mi * WMMA_M,
+                        lane_m_base, tr_k_group, tr_col_sub, g_buf_byte,
+                    )
                 return _tr_read_frag(
                     g_lds_off, SG, warp_n_base, mi * WMMA_M,
                     lane_m_base, tr_k_group, tr_col_sub, g_buf_byte,
                 )
 
             def read_b(nj):
+                if const_expr(dma_swizzle):
+                    return _tr_read_frag_swz(
+                        smem_raw_ptr, x_lds_off, SX, CPR_X_SWZ, warp_k_base, nj * WMMA_N,
+                        lane_m_base, tr_k_group, tr_col_sub, x_buf_byte,
+                    )
                 return _tr_read_frag(
                     x_lds_off, SX, warp_k_base, nj * WMMA_N,
                     lane_m_base, tr_k_group, tr_col_sub, x_buf_byte,
@@ -331,6 +448,35 @@ def compile_moe_wgrad_v2(
 
             new_accs = [None] * NACC
             b_frags = [None] * N_STEPS
+
+            if const_expr(dma_prefetch is not None):
+                # DMA path: burst *all* current-tile transpose reads first, then issue the
+                # next-tile DMA. Keeping the reads ahead of the DMA in program order stops
+                # the compiler from planting an ``s_waitcnt vmcnt(0)`` in front of the first
+                # ds_read (which would drain the whole prefetch before compute); the DMA
+                # then streams under the MFMA burst instead.
+                a_frags = [read_a(mi) for mi in range_constexpr(M_STEPS)]
+                for nj in range_constexpr(N_STEPS):
+                    b_frags[nj] = read_b(nj)
+                # Fence the scheduler so the read burst stays *ahead* of the DMA issue --
+                # otherwise the compiler hoists the next-tile buffer_load_lds above the
+                # transpose reads and re-plants an ``s_waitcnt vmcnt(0)`` that drains the
+                # prefetch before compute.
+                rocdl.sched_barrier(0)
+                dma_prefetch()
+                rocdl.sched_barrier(0)
+                rocdl.s_setprio(1)
+                for mi in range_constexpr(M_STEPS):
+                    for nj in range_constexpr(N_STEPS):
+                        idx = mi * N_STEPS + nj
+                        new_accs[idx] = rocdl.mfma_f32_16x16x32_bf16(
+                            T.vec(C_FRAG, T.f32),
+                            [a_frags[mi], b_frags[nj], accs[idx], 0, 0, 0],
+                        )
+                    rocdl.sched_barrier(0)
+                rocdl.s_setprio(0)
+                return new_accs
+
             a_next = read_a(0)
             b_frags[0] = read_b(0)  # first B needed for the very first MFMA
             rocdl.s_setprio(1)
@@ -364,15 +510,35 @@ def compile_moe_wgrad_v2(
         def _pack_ids(g_ids, x_ids):
             return (g_ids + x_ids)
 
-        # 2-stage ping-pong pipeline: MFMA the current LDS buffer while the next step's
-        # global gather is in flight, then stage it into the *other* buffer -- so a single
-        # barrier per step suffices (no store->barrier->compute serialization). Slot ids run
-        # one step ahead of the data (loaded here, consumed next iteration) via iter_args.
-        g_ids0, x_ids0 = load_slot_ids(c0)
-        store_grad(gather_grad(g_ids0, c0), c0)
-        store_x(gather_x(x_ids0, c0), c0)
-        _barrier()
-        g_ids_next, x_ids_next = load_slot_ids(step)
+        # NUM_BUF-stage ping-pong pipeline: MFMA the current LDS buffer while the next
+        # step's global gather is in flight, then stage it into another buffer -- so a
+        # single barrier per step suffices (no store->barrier->compute serialization).
+        # Prefetch distance D == NUM_BUF - 1: the DMA path stages D tiles up front and, for
+        # NUM_BUF > 2, keeps the most-recently-issued tile's DMA in flight across the
+        # barrier (graduated ``vmcnt``) so it overlaps two MFMA steps instead of one. Slot
+        # ids run D steps ahead of the data they address (loaded here, consumed D iterations
+        # later once their vmem load has already retired) via iter_args.
+        D = NUM_BUF - 1
+        PER_TILE_DMA = G_FILLS + X_FILLS
+        DMA_KEEP = (NUM_BUF - 2) * PER_TILE_DMA
+        if const_expr(dma_swizzle):
+            # Prologue: stage tiles 0..D-1 into buffers 0..D-1, then drain fully.
+            for j in range_constexpr(D):
+                j_slot = arith.index(j * WMMA_K)
+                gidj, xidj = load_slot_ids(j_slot)
+                dma_fill(
+                    gidj, xidj, j_slot,
+                    fx.Int32(j * G_TILE_ELEMS * 2), fx.Int32(j * X_TILE_ELEMS * 2),
+                )
+            _dma_barrier()
+            # Carried ids address the first tile the loop prefetches (tile D).
+            g_ids_next, x_ids_next = load_slot_ids(arith.index(D * WMMA_K))
+        else:
+            g_ids0, x_ids0 = load_slot_ids(c0)
+            store_grad(gather_grad(g_ids0, c0), c0)
+            store_x(gather_x(x_ids0, c0), c0)
+            _barrier()
+            g_ids_next, x_ids_next = load_slot_ids(step)
 
         loop = scf.ForOp(
             c0, num_slots, step, iter_args=acc_init + _pack_ids(g_ids_next, x_ids_next)
@@ -384,32 +550,62 @@ def compile_moe_wgrad_v2(
             x_ids = [loop.body.arguments[1 + NACC + G_FILLS + i] for i in range(X_FILLS)]
 
             it = fx.Int32(arith.index_cast(T.i32, s_base)) // fx.Int32(WMMA_K)
-            cur = it % fx.Int32(2)
-            nxt = fx.Int32(1) - cur
-            cur_g_byte = cur * fx.Int32(G_TILE_ELEMS * 2)
-            cur_x_byte = cur * fx.Int32(X_TILE_ELEMS * 2)
-            nxt_g_elem = arith.index_cast(T.index, nxt * fx.Int32(G_TILE_ELEMS))
-            nxt_x_elem = arith.index_cast(T.index, nxt * fx.Int32(X_TILE_ELEMS))
 
-            # Issue next step's data gather using the slot ids carried in (already resident).
-            # The carried ids belong to slot base ``s_base + step`` (one contraction tile
-            # ahead), so the compact grad rows walk from that same base.
-            g_regs_next = gather_grad(g_ids, s_base + step)
-            x_regs_next = gather_x(x_ids, s_base + step)
-            # Prefetch the slot ids two steps ahead; carried out to the next iteration so
-            # their global-load latency overlaps this step's MFMA.
-            g_ids_nxt, x_ids_nxt = load_slot_ids(s_base + step + step)
+            if const_expr(dma_swizzle):
+                cur = it % fx.Int32(NUM_BUF)
+                cur_g_byte = cur * fx.Int32(G_TILE_ELEMS * 2)
+                cur_x_byte = cur * fx.Int32(X_TILE_ELEMS * 2)
+                # Prefetch tile it+D into buffer (it+D) % NUM_BUF, D contraction tiles ahead.
+                pf = (it + fx.Int32(D)) % fx.Int32(NUM_BUF)
+                pf_g_byte = pf * fx.Int32(G_TILE_ELEMS * 2)
+                pf_x_byte = pf * fx.Int32(X_TILE_ELEMS * 2)
+                pf_slot = s_base + arith.index(D * WMMA_K)
+                # Prefetch the slot ids D+1 steps ahead (carried in as the tile-(it+D) ids,
+                # yielded here for tile it+D+1); D iterations of lead means their vmem load
+                # has retired before ``dma_fill`` consumes them, so it does not force a
+                # premature vmcnt that would drain the in-flight prefetch.
+                g_ids_nxt, x_ids_nxt = load_slot_ids(s_base + arith.index((D + 1) * WMMA_K))
+                # ``compute`` bursts the current-tile reads first, then invokes this
+                # callback to issue the next tile's global->LDS DMA, so the DMA streams
+                # under the MFMA burst without draining in front of the transpose reads.
+                new_accs = compute(
+                    accs, cur_g_byte, cur_x_byte,
+                    dma_prefetch=lambda: dma_fill(
+                        g_ids, x_ids, pf_slot, pf_g_byte, pf_x_byte
+                    ),
+                )
+                # Graduated drain + barrier: keep DMA_KEEP vmem ops (the just-issued tile's
+                # DMA for NUM_BUF > 2) in flight so it overlaps the next step's MFMA; the
+                # tile read next iteration is fully drained.
+                _dma_barrier(DMA_KEEP)
+                scf.YieldOp(new_accs + _pack_ids(g_ids_nxt, x_ids_nxt))
+            else:
+                cur = it % fx.Int32(2)
+                nxt = fx.Int32(1) - cur
+                cur_g_byte = cur * fx.Int32(G_TILE_ELEMS * 2)
+                cur_x_byte = cur * fx.Int32(X_TILE_ELEMS * 2)
+                nxt_g_elem = arith.index_cast(T.index, nxt * fx.Int32(G_TILE_ELEMS))
+                nxt_x_elem = arith.index_cast(T.index, nxt * fx.Int32(X_TILE_ELEMS))
 
-            new_accs = compute(accs, cur_g_byte, cur_x_byte)
+                # Issue next step's data gather using the slot ids carried in (already
+                # resident). The carried ids belong to slot base ``s_base + step`` (one
+                # contraction tile ahead), so the compact grad rows walk from that base.
+                g_regs_next = gather_grad(g_ids, s_base + step)
+                x_regs_next = gather_x(x_ids, s_base + step)
+                # Prefetch the slot ids two steps ahead; carried out to the next iteration
+                # so their global-load latency overlaps this step's MFMA.
+                g_ids_nxt, x_ids_nxt = load_slot_ids(s_base + step + step)
 
-            # Pin the mask+store (consumers of the in-flight next-tile loads) *after* the
-            # MFMA so their `s_waitcnt vmcnt` isn't hoisted in front of the matrix ops --
-            # the matrix pipe then runs while those loads are still in flight.
-            rocdl.sched_barrier(0)
-            store_grad(g_regs_next, nxt_g_elem)
-            store_x(x_regs_next, nxt_x_elem)
-            _barrier()
-            scf.YieldOp(new_accs + _pack_ids(g_ids_nxt, x_ids_nxt))
+                new_accs = compute(accs, cur_g_byte, cur_x_byte)
+
+                # Pin the mask+store (consumers of the in-flight next-tile loads) *after*
+                # the MFMA so their `s_waitcnt vmcnt` isn't hoisted in front of the matrix
+                # ops -- the matrix pipe then runs while those loads are still in flight.
+                rocdl.sched_barrier(0)
+                store_grad(g_regs_next, nxt_g_elem)
+                store_x(x_regs_next, nxt_x_elem)
+                _barrier()
+                scf.YieldOp(new_accs + _pack_ids(g_ids_nxt, x_ids_nxt))
 
         accs = [loop.results[i] for i in range(NACC)]
 
@@ -466,10 +662,20 @@ def compile_moe_wgrad_v2(
         num_experts: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
         ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
+        if const_expr(dma_swizzle):
+            with ir.InsertionPoint(ctx.gpu_module_body):
+                _llvm.GlobalOp(
+                    global_type=ir.Type.parse(f"!llvm.array<{LDS_TOTAL_BYTES} x i8>"),
+                    sym_name=LDS_SYM,
+                    linkage=ir.Attribute.parse("#llvm.linkage<external>"),
+                    addr_space=3,
+                    alignment=1024,
+                )
+        else:
+            allocator.finalized = False
+            with ir.InsertionPoint(ctx.gpu_module_body):
+                allocator.finalize()
         gx = (N + block_n - 1) // block_n
         gy = (K + block_k - 1) // block_k
         gz = num_experts
@@ -510,6 +716,58 @@ def _tr_read_frag(
     hi_byte = 2 * 4 * stride     # compile-time lo->hi row shift (bytes, 4 rows apart)
     lo = _ds_read_tr_bf16x4(base_ptr, col_byte)
     hi = _ds_read_tr_bf16x4(base_ptr, col_byte + hi_byte)
+    return lo.shuffle(hi, [0, 1, 2, 3, 4, 5, 6, 7])
+
+
+def _gep_lds(base_ptr, byte_i32):
+    """GEP an LDS !llvm.ptr<3> by a runtime i8 byte offset off a real LDS base pointer.
+
+    ``buffer_load_lds`` derives its M0 write base from the LDS pointer, which the backend
+    only lowers correctly when the pointer is a GEP off a genuine addrspace(3) global (an
+    ``inttoptr`` address is fine for ``ds_read`` but not for the DMA). We route the reads
+    through the same base so alias analysis ties the DMA writes to the transpose reads.
+    """
+    return _llvm.getelementptr(
+        ir.Type.parse("!llvm.ptr<3>"), rocdl._to_ir(base_ptr), [rocdl._to_ir(byte_i32)],
+        [-(2 ** 31)], T.i8, None,
+    )
+
+
+def _tr_read_frag_swz(
+    smem_base, lds_off, stride, cpr, warp_col_base, col_const,
+    lane_m_base, tr_k_group, tr_col_sub, buf_byte,
+):
+    """Swizzled counterpart of ``_tr_read_frag`` for the DMA fill (un-padded LDS).
+
+    The DMA writes each contraction tile contiguously (stride == feature span), so bank
+    conflicts on the transpose read are broken by an XOR *chunk* swizzle instead of row
+    padding: the physical feature chunk of logical ``(slot, feat)`` is
+    ``(feat // FILL_V) XOR (slot & (cpr - 1))`` -- the *same* map the fill applies to the
+    global gather column, so the read lands on exactly the element the DMA staged.
+
+    ``ds_read_tr16_b64`` gathers per-lane (each lane reads its own 4 contiguous features
+    and the transpose is a fixed cross-lane shuffle), so a per-lane swizzled address is
+    correct with no change to the transpose semantics. Because the XOR mixes the feature
+    bits, the per-fragment column shift and the lo->hi (4-slot) shift can no longer ride
+    the ``ds_read`` immediate ``offset:`` -- both addresses are computed explicitly.
+    """
+    col_run = warp_col_base + tr_col_sub * fx.Int32(4)
+    feat_log = col_run + fx.Int32(col_const)          # logical feature column
+    chunk = feat_log // fx.Int32(FILL_V)
+    within = feat_log % fx.Int32(FILL_V)
+    row_lo = lane_m_base * fx.Int32(8) + tr_k_group   # contraction slot (0..31)
+
+    def _read(slot):
+        swz = (slot & fx.Int32(cpr - 1)) if _DMA_SWZ_ON else fx.Int32(0)
+        phys_chunk = chunk ^ swz
+        phys_feat = phys_chunk * fx.Int32(FILL_V) + within
+        elem = slot * fx.Int32(stride) + phys_feat
+        byte = elem * fx.Int32(2) + fx.Int32(lds_off) + buf_byte
+        raw = rocdl.ds_read_tr16_b64(T.vec(4, T.bf16), _gep_lds(smem_base, byte)).result
+        return fx.Vector(raw, (4,), fx.BFloat16)
+
+    lo = _read(row_lo)
+    hi = _read(row_lo + fx.Int32(4))
     return lo.shuffle(hi, [0, 1, 2, 3, 4, 5, 6, 7])
 
 
