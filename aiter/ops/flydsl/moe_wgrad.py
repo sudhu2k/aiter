@@ -11,12 +11,51 @@ routing metadata (``sorted_slot_ids`` holding the received-token row per slot, p
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .kernels.moe_wgrad_flydsl_v2 import compile_moe_wgrad_v2, WGRAD_BLOCK_M
 from .kernels.tensor_shim import ptr_arg, _run_compiled
 
 __all__ = ["flydsl_moe_wgrad", "flydsl_moe_wgrad_autotuned", "WGRAD_BLOCK_M"]
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    return int(v) if v is not None and v.strip() != "" else default
+
+
+# Best-performing wgrad fill/pipeline defaults on CDNA4 (per the DMA+swizzle 3-stage
+# sweep: ~+7-12% over the padded baseline on the Qwen shapes). These are the fill/
+# pipeline knobs only -- the workgroup *tile* is still autotuned per shape. Override
+# via env:
+#   AITER_WGRAD_DMA_SWIZZLE  global->LDS DMA + XOR swizzle fill      (default on)
+#   AITER_WGRAD_PIPE_STAGES  LDS pipeline depth (3 = triple buffer)  (default 3)
+#   AITER_WGRAD_SPREAD_DMA   interleave DMA issue across the MFMAs    (default on)
+_WGRAD_DMA_SWIZZLE = _env_flag("AITER_WGRAD_DMA_SWIZZLE", True)
+_WGRAD_PIPE_STAGES = _env_int("AITER_WGRAD_PIPE_STAGES", 3)
+_WGRAD_SPREAD_DMA = _env_flag("AITER_WGRAD_SPREAD_DMA", True)
+
+
+def _resolve_dma_opts(swap_gather: bool):
+    """Resolve the (dma_swizzle, pipe_stages, spread_dma) triple from env defaults.
+
+    ``dma_swizzle`` does not yet support ``swap_gather`` (FC2), so it is force-disabled
+    there; the dependent knobs (``pipe_stages`` > 2, ``spread_dma``) collapse to their
+    ping-pong-safe values whenever DMA is off so the kernel never hits an invalid combo.
+    """
+    dma = _WGRAD_DMA_SWIZZLE and not swap_gather
+    stages = _WGRAD_PIPE_STAGES if dma else 2
+    spread = _WGRAD_SPREAD_DMA if dma else False
+    return dma, stages, spread
 
 
 def _resolve_out_dtype(dw: torch.Tensor, out_dtype):
@@ -49,6 +88,9 @@ def flydsl_moe_wgrad(
     accumulate: bool = False,
     out_dtype: str | None = None,
     swap_gather: bool = False,
+    dma_swizzle: bool | None = None,
+    pipe_stages: int | None = None,
+    spread_dma: bool | None = None,
 ) -> None:
     """Compute the grouped wgrad ``grad[route]^T @ x[token(route)]`` into ``dw``, per expert.
 
@@ -81,6 +123,17 @@ def flydsl_moe_wgrad(
     assert x.is_contiguous() and grad.is_contiguous() and dw.is_contiguous()
     out_dtype = _resolve_out_dtype(dw, out_dtype)
 
+    # Fill/pipeline knobs default to the env-configured best config; explicit args win.
+    _dma, _stages, _spread = _resolve_dma_opts(bool(swap_gather))
+    if dma_swizzle is not None:
+        _dma = bool(dma_swizzle)
+        _stages = _stages if _dma else 2
+        _spread = _spread if _dma else False
+    if pipe_stages is not None:
+        _stages = int(pipe_stages)
+    if spread_dma is not None:
+        _spread = bool(spread_dma)
+
     exe = compile_moe_wgrad_v2(
         dtype="bf16",
         block_n=int(block_n),
@@ -90,6 +143,9 @@ def flydsl_moe_wgrad(
         accumulate=bool(accumulate),
         out_dtype=out_dtype,
         swap_gather=bool(swap_gather),
+        dma_swizzle=_dma,
+        pipe_stages=_stages,
+        spread_dma=_spread,
     )
 
     _run_compiled(
@@ -143,13 +199,22 @@ def _wgrad_run(
     warps_n=2,
     warps_k=2,
 ):
-    """Dispatch target for the FlyDSL autotuner: compile (lru-cached) + launch one tile."""
+    """Dispatch target for the FlyDSL autotuner: compile (lru-cached) + launch one tile.
+
+    Uses the env-configured fill/pipeline defaults so the tile sweep is benchmarked in
+    the same mode the production launch will run (the best tile depends on it -- the DMA
+    3-stage path favors the large 256x256 tile).
+    """
+    _dma, _stages, _spread = _resolve_dma_opts(False)
     exe = compile_moe_wgrad_v2(
         dtype="bf16",
         block_n=int(block_n),
         block_k=int(block_k),
         warps_n=int(warps_n),
         warps_k=int(warps_k),
+        dma_swizzle=_dma,
+        pipe_stages=_stages,
+        spread_dma=_spread,
     )
     _run_compiled(
         exe,
