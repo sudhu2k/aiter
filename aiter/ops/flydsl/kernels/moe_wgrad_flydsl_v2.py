@@ -93,8 +93,8 @@ def compile_moe_wgrad_v2(
     accumulate: bool = False,
     out_dtype: str = "bf16",
     swap_gather: bool = False,
-    dma_swizzle: bool = False,
-    pipe_stages: int = 2,
+    dma_swizzle: bool = True,
+    pipe_stages: int = 3,
     agpr_accumulators: bool = False,
 ):
     if dtype != "bf16":
@@ -644,72 +644,157 @@ def compile_moe_wgrad_v2(
         # later once their vmem load has already retired) via iter_args.
         D = NUM_BUF - 1
         PER_TILE_DMA = G_FILLS + X_FILLS
-        DMA_KEEP = (NUM_BUF - 2) * PER_TILE_DMA
+        # Graduated ``vmcnt`` kept in flight across each sub-tile's barrier: for NUM_BUF > 2
+        # this leaves the just-issued tile's DMA streaming (only the tile read next is fully
+        # drained); 0 for the 2-buffer distance-1 ring.
+        KEEP = (NUM_BUF - 2) * PER_TILE_DMA
+        acc_ty = T.vec(C_FRAG, T.f32)
+
         if const_expr(dma_swizzle):
-            # Prologue: stage tiles 0..D-1 into buffers 0..D-1, then drain fully.
+            # ---- DMA path: static NUM_BUF-buffer ring, distance-D, slot-loop unrolled by
+            # NUM_BUF (mirrors the fwd v2 fix). Sub-tile j always reads buffer j and
+            # prefetches tile (base+j+D) into buffer (j+D) % NUM_BUF -- both *Python
+            # constants*, so every LDS byte offset is a compile-time constant. The backend
+            # can then prove read(buf j) never aliases the in-flight DMA write(buf
+            # (j+D) % NUM_BUF) and keeps the prefetch streaming under the transpose-read +
+            # MFMA burst, instead of the conservative ``s_waitcnt vmcnt(0)`` the dynamic
+            # ``it % NUM_BUF`` ring forced in front of the reads (dynamic offsets into the
+            # single raw LDS global defeated its alias analysis).
+            def g_byte(j):
+                return fx.Int32((j % NUM_BUF) * G_TILE_ELEMS * 2)
+
+            def x_byte(j):
+                return fx.Int32((j % NUM_BUF) * X_TILE_ELEMS * 2)
+
+            # Slot ids are carried NUM_BUF-ahead (one physical iteration) so their ~500-cycle
+            # SORTED-load latency is retired before ``dma_fill`` consumes them: iteration p
+            # carries the NUM_BUF id-sets for the tiles it prefetches (p*NUM_BUF + j + D).
+            ID_SET = G_FILLS + X_FILLS
+
+            def pack_idsets(sets):
+                out = []
+                for g_ids, x_ids in sets:
+                    out += g_ids + x_ids
+                return out
+
+            def unpack_idsets(args, base):
+                sets = []
+                for s in range_constexpr(NUM_BUF):
+                    off = base + s * ID_SET
+                    g_ids = [args[off + i] for i in range(G_FILLS)]
+                    x_ids = [args[off + G_FILLS + i] for i in range(X_FILLS)]
+                    sets.append((g_ids, x_ids))
+                return sets
+
+            def mk_prefetch(g_ids, x_ids, pf_slot, wbuf):
+                return lambda: dma_fill(g_ids, x_ids, pf_slot, g_byte(wbuf), x_byte(wbuf))
+
+            # Prologue: stage tiles 0..D-1 into buffers 0..D-1 (distance-D), then drain fully.
             for j in range_constexpr(D):
                 j_slot = arith.index(j * WMMA_K)
                 gidj, xidj = load_slot_ids(j_slot)
-                dma_fill(
-                    gidj, xidj, j_slot,
-                    fx.Int32(j * G_TILE_ELEMS * 2), fx.Int32(j * X_TILE_ELEMS * 2),
-                )
+                dma_fill(gidj, xidj, j_slot, g_byte(j), x_byte(j))
             _dma_barrier()
-            # Carried ids address the first tile the loop prefetches (tile D).
-            g_ids_next, x_ids_next = load_slot_ids(arith.index(D * WMMA_K))
+            # Initial carried id-sets: iteration 0 prefetches tiles D..D+NUM_BUF-1.
+            init_sets = [
+                load_slot_ids(arith.index((D + j) * WMMA_K))
+                for j in range_constexpr(NUM_BUF)
+            ]
+
+            ntiles = fx.Int32(arith.index_cast(T.i32, num_slots)) // fx.Int32(WMMA_K)
+            group_end = arith.index_cast(
+                T.index, (ntiles // fx.Int32(NUM_BUF)) * fx.Int32(NUM_BUF * WMMA_K)
+            )
+            step_big = arith.index(NUM_BUF * WMMA_K)
+
+            loop = scf.ForOp(
+                c0, group_end, step_big, iter_args=acc_init + pack_idsets(init_sets)
+            )
+            with ir.InsertionPoint(loop.body):
+                s_base = loop.induction_variable
+                if const_expr(agpr_accumulators):
+                    accs = []
+                else:
+                    accs = [loop.body.arguments[1 + i] for i in range(NACC)]
+                cur_sets = unpack_idsets(loop.body.arguments, 1 + acc_iter_args)
+
+                # sub-tile j: read buffer j (tile s_base+j), prefetch tile s_base+j+D into
+                # buffer (j+D) % NUM_BUF using its carried id-set. ``compute`` bursts the
+                # current-tile transpose reads first, then issues the prefetch DMA, so it
+                # streams under the MFMA burst without draining in front of the reads.
+                for j in range_constexpr(NUM_BUF):
+                    g_ids_j, x_ids_j = cur_sets[j]
+                    pf_slot = s_base + arith.index((j + D) * WMMA_K)
+                    accs = compute(
+                        accs, g_byte(j), x_byte(j),
+                        dma_prefetch=mk_prefetch(g_ids_j, x_ids_j, pf_slot, j + D),
+                    )
+                    _dma_barrier(KEEP)
+
+                # Load next iteration's carried id-sets (tiles (s_base+NUM_BUF)+j+D).
+                nxt_sets = [
+                    load_slot_ids(s_base + arith.index((NUM_BUF + D + j) * WMMA_K))
+                    for j in range_constexpr(NUM_BUF)
+                ]
+                scf.YieldOp(accs + pack_idsets(nxt_sets))
+
+            if const_expr(agpr_accumulators):
+                accs = []
+            else:
+                accs = [loop.results[i] for i in range(NACC)]
+
+            # Tail: rem in 0..NUM_BUF-1 leftover tiles, already prefetched into buffers
+            # 0..rem-1 by the last group. Drain any in-flight DMA, then consume read-only
+            # (no prefetch). ``num_slots`` is workgroup-uniform, so the branches are uniform.
+            _dma_barrier()
+            rem = ntiles - (ntiles // fx.Int32(NUM_BUF)) * fx.Int32(NUM_BUF)
+            if const_expr(agpr_accumulators):
+                for j in range_constexpr(NUM_BUF - 1):
+                    has_j = arith.cmpi(arith.CmpIPredicate.ugt, rem, fx.Int32(j))
+                    tif = scf.IfOp(has_j, results_=[], has_else=False)
+                    with ir.InsertionPoint(tif.then_block):
+                        compute(accs, g_byte(j), x_byte(j), dma_prefetch=None)
+                        scf.YieldOp([])
+            else:
+                def _tail(j, accs):
+                    if const_expr(j >= NUM_BUF - 1):
+                        return accs
+                    has_j = arith.cmpi(arith.CmpIPredicate.ugt, rem, fx.Int32(j))
+                    tif = scf.IfOp(has_j, results_=[acc_ty] * NACC, has_else=True)
+                    with ir.InsertionPoint(tif.then_block):
+                        a2 = compute(accs, g_byte(j), x_byte(j), dma_prefetch=None)
+                        scf.YieldOp(_tail(j + 1, a2))
+                    with ir.InsertionPoint(tif.else_block):
+                        scf.YieldOp(accs)
+                    return [tif.results[i] for i in range(NACC)]
+                accs = _tail(0, accs)
         else:
+            # ---- Register path: 2-buffer ping/pong (global->VGPR->ds_write) ----
             g_ids0, x_ids0 = load_slot_ids(c0)
             store_grad(gather_grad(g_ids0, c0), c0)
             store_x(gather_x(x_ids0, c0), c0)
             _barrier()
             g_ids_next, x_ids_next = load_slot_ids(step)
 
-        loop = scf.ForOp(
-            c0, num_slots, step, iter_args=acc_init + _pack_ids(g_ids_next, x_ids_next)
-        )
-        with ir.InsertionPoint(loop.body):
-            s_base = loop.induction_variable
-            if const_expr(agpr_accumulators):
-                accs = []
-            else:
-                accs = [loop.body.arguments[1 + i] for i in range(NACC)]
-            g_ids = [loop.body.arguments[1 + acc_iter_args + i] for i in range(G_FILLS)]
-            x_ids = [
-                loop.body.arguments[1 + acc_iter_args + G_FILLS + i]
-                for i in range(X_FILLS)
-            ]
+            loop = scf.ForOp(
+                c0, num_slots, step,
+                iter_args=acc_init + _pack_ids(g_ids_next, x_ids_next),
+            )
+            with ir.InsertionPoint(loop.body):
+                s_base = loop.induction_variable
+                if const_expr(agpr_accumulators):
+                    accs = []
+                else:
+                    accs = [loop.body.arguments[1 + i] for i in range(NACC)]
+                g_ids = [
+                    loop.body.arguments[1 + acc_iter_args + i] for i in range(G_FILLS)
+                ]
+                x_ids = [
+                    loop.body.arguments[1 + acc_iter_args + G_FILLS + i]
+                    for i in range(X_FILLS)
+                ]
 
-            it = fx.Int32(arith.index_cast(T.i32, s_base)) // fx.Int32(WMMA_K)
-
-            if const_expr(dma_swizzle):
-                cur = it % fx.Int32(NUM_BUF)
-                cur_g_byte = cur * fx.Int32(G_TILE_ELEMS * 2)
-                cur_x_byte = cur * fx.Int32(X_TILE_ELEMS * 2)
-                # Prefetch tile it+D into buffer (it+D) % NUM_BUF, D contraction tiles ahead.
-                pf = (it + fx.Int32(D)) % fx.Int32(NUM_BUF)
-                pf_g_byte = pf * fx.Int32(G_TILE_ELEMS * 2)
-                pf_x_byte = pf * fx.Int32(X_TILE_ELEMS * 2)
-                pf_slot = s_base + arith.index(D * WMMA_K)
-                # Prefetch the slot ids D+1 steps ahead (carried in as the tile-(it+D) ids,
-                # yielded here for tile it+D+1); D iterations of lead means their vmem load
-                # has retired before ``dma_fill`` consumes them, so it does not force a
-                # premature vmcnt that would drain the in-flight prefetch.
-                g_ids_nxt, x_ids_nxt = load_slot_ids(s_base + arith.index((D + 1) * WMMA_K))
-                # ``compute`` bursts the current-tile reads first, then invokes this
-                # callback to issue the next tile's global->LDS DMA, so the DMA streams
-                # under the MFMA burst without draining in front of the transpose reads.
-                new_accs = compute(
-                    accs, cur_g_byte, cur_x_byte,
-                    dma_prefetch=lambda: dma_fill(
-                        g_ids, x_ids, pf_slot, pf_g_byte, pf_x_byte
-                    ),
-                )
-                # Graduated drain + barrier: keep DMA_KEEP vmem ops (the just-issued tile's
-                # DMA for NUM_BUF > 2) in flight so it overlaps the next step's MFMA; the
-                # tile read next iteration is fully drained.
-                _dma_barrier(DMA_KEEP)
-                scf.YieldOp(new_accs + _pack_ids(g_ids_nxt, x_ids_nxt))
-            else:
+                it = fx.Int32(arith.index_cast(T.i32, s_base)) // fx.Int32(WMMA_K)
                 cur = it % fx.Int32(2)
                 nxt = fx.Int32(1) - cur
                 cur_g_byte = cur * fx.Int32(G_TILE_ELEMS * 2)
@@ -737,10 +822,10 @@ def compile_moe_wgrad_v2(
                 _barrier()
                 scf.YieldOp(new_accs + _pack_ids(g_ids_nxt, x_ids_nxt))
 
-        if const_expr(agpr_accumulators):
-            accs = []
-        else:
-            accs = [loop.results[i] for i in range(NACC)]
+            if const_expr(agpr_accumulators):
+                accs = []
+            else:
+                accs = [loop.results[i] for i in range(NACC)]
 
         # Epilogue: C[m=n_feat, n=k_feat], lane holds 4 rows. Each dW element is owned by
         # exactly one workgroup (grid = N x K x E over disjoint output tiles), so when

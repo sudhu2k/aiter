@@ -37,6 +37,13 @@ _LDS_LIMIT = 163840  # gfx950 per-workgroup LDS (160 KB)
 _WARP_CHOICES = [1, 2, 4, 8, 16]
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def _warp_valid(block_m, block_n, block_k, wm, wn):
     n_threads = wm * wn * _WARP
     if block_m % (wm * _WMMA) or block_n % (wn * _WMMA):
@@ -79,12 +86,13 @@ def _pick_warps(block_m: int, block_n: int, block_k: int):
 
 
 def _fwd_buffering():
-    """(num_buffers, lds_pad) implied by the MOE_FWD_* env, mirroring the v2 kernel: the DMA
-    path runs a distance-2, 3-buffer ring (K-loop unrolled by 3) so it uses 3 LDS buffers;
-    the register path keeps the classic 2-buffer ping/pong. swizzle/DMA drop the pad for a
-    power-of-two stride."""
-    use_dma = os.environ.get("MOE_FWD_DMA", "").strip().lower() in ("1", "dma", "on")
-    swz = os.environ.get("MOE_FWD_SWZ", "").strip().lower() not in ("0", "off", "false", "no")
+    """(num_buffers, lds_pad) for the production DMA+swizzle fill path.
+
+    Both default on (opt out with ``MOE_FWD_DMA=0`` / ``MOE_FWD_SWZ=0``). The DMA path runs
+    a distance-2, 3-buffer ring; the register fallback keeps 2-buffer ping/pong.
+    """
+    use_dma = _env_flag("MOE_FWD_DMA", True)
+    swz = _env_flag("MOE_FWD_SWZ", True)
     pad = 0 if (use_dma or swz) else _LDS_PAD
     return (3 if use_dma else 2), pad
 
@@ -252,8 +260,8 @@ def flydsl_moe_fwd(
     )
 
 
-# Tile/warp configs the autotuner sweeps: (block_n, block_k, warps_m, warps_n). Invalid ones
-# for a given (block_m, gated) -- divisibility or LDS -- are filtered at tune time.
+# Tile/warp configs the autotuner sweeps: (block_n, block_k, warps_m, warps_n). Fill path
+# (DMA+swizzle, 3-buffer) is fixed at the env defaults above -- only tile geometry is tuned.
 _FWD_TUNE_CONFIGS = [
     (64, 64, 2, 2),
     (128, 64, 2, 2),
@@ -301,10 +309,8 @@ def flydsl_moe_fwd_autotuned(
     """Shape-autotuned :func:`flydsl_moe_fwd`.
 
     On the first call for a given (block_m, GEMM shape, epilogue mode) the valid subset of
-    ``_FWD_TUNE_CONFIGS`` is benchmarked (the gather-GEMM is idempotent for fixed inputs, so
-    no reset is needed) and the fastest ``(block_n, block_k, warps_m, warps_n)`` is cached;
-    later calls reuse it with no tuning overhead. Falls back to the single-shot heuristic
-    (:func:`flydsl_moe_fwd`) when only one config is viable.
+    ``_FWD_TUNE_CONFIGS`` is benchmarked and the fastest ``(block_n, block_k, warps_m, warps_n)``
+    is cached. The production DMA+swizzle fill path is always used; only tile geometry is swept.
     """
     gated = activation is not None
     N_OUT, K = int(B.shape[1]), int(B.shape[2])

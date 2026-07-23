@@ -199,13 +199,18 @@ def compile_moe_gemm1(
     # the workgroup barrier) instead of exposing a post-compute ds_write. The DMA
     # writes LDS contiguously in lane order, which requires unpadded rows, so the
     # LDS tiles drop their bank-conflict padding in this mode.
-    use_dma = os.environ.get("MOE_FWD_DMA", "").strip().lower() in ("1", "dma", "on")
+    def _env_on(name: str, default: bool = True) -> bool:
+        v = os.environ.get(name)
+        if v is None:
+            return default
+        return v.strip().lower() not in ("0", "off", "false", "no")
+
+    use_dma = _env_on("MOE_FWD_DMA", True)
     # XOR bank-swizzle replaces LDS_PAD: keeps a power-of-two (unpadded) row stride while
     # staying bank-conflict-free on the transpose read. Implies the DMA path's unpadded layout.
     # Default-on to match the tuned GEMM's unconditional XOR16 swizzle (frees the LDS_PAD row
     # padding for a power-of-two stride); opt out with MOE_FWD_SWZ=0 to compare against padding.
-    _swz_env = os.environ.get("MOE_FWD_SWZ", "").strip().lower()
-    use_swz = _swz_env not in ("0", "off", "false", "no")
+    use_swz = _env_on("MOE_FWD_SWZ", True)
     lds_pad = 0 if (use_dma or use_swz) else LDS_PAD
 
     WM = block_m // warps_m       # per-warp route span

@@ -39,24 +39,20 @@ def _env_int(name: str, default: int) -> int:
 # via env:
 #   AITER_WGRAD_DMA_SWIZZLE  global->LDS DMA + XOR swizzle fill      (default on)
 #   AITER_WGRAD_PIPE_STAGES  LDS pipeline depth (3 = triple buffer)  (default 3)
-#   AITER_WGRAD_SPREAD_DMA   interleave DMA issue across the MFMAs    (default on)
 _WGRAD_DMA_SWIZZLE = _env_flag("AITER_WGRAD_DMA_SWIZZLE", True)
 _WGRAD_PIPE_STAGES = _env_int("AITER_WGRAD_PIPE_STAGES", 3)
-_WGRAD_SPREAD_DMA = _env_flag("AITER_WGRAD_SPREAD_DMA", True)
 
 
 def _resolve_dma_opts(swap_gather: bool):
-    """Resolve the (dma_swizzle, pipe_stages, spread_dma) triple from env defaults.
+    """Resolve the (dma_swizzle, pipe_stages) pair from env defaults.
 
     The DMA+swizzle fill supports both FC1 and FC2 (``swap_gather``): the token-gathered
-    operand simply moves from ``x`` to ``grad``. The dependent knobs (``pipe_stages`` > 2,
-    ``spread_dma``) collapse to their ping-pong-safe values whenever DMA is off so the
-    kernel never hits an invalid combo.
+    operand simply moves from ``x`` to ``grad``. ``pipe_stages`` > 2 collapses to 2 whenever
+    DMA is off so the kernel never hits an invalid combo.
     """
     dma = _WGRAD_DMA_SWIZZLE
     stages = _WGRAD_PIPE_STAGES if dma else 2
-    spread = _WGRAD_SPREAD_DMA if dma else False
-    return dma, stages, spread
+    return dma, stages
 
 
 def _resolve_out_dtype(dw: torch.Tensor, out_dtype):
@@ -91,7 +87,6 @@ def flydsl_moe_wgrad(
     swap_gather: bool = False,
     dma_swizzle: bool | None = None,
     pipe_stages: int | None = None,
-    spread_dma: bool | None = None,
 ) -> None:
     """Compute the grouped wgrad ``grad[route]^T @ x[token(route)]`` into ``dw``, per expert.
 
@@ -125,15 +120,12 @@ def flydsl_moe_wgrad(
     out_dtype = _resolve_out_dtype(dw, out_dtype)
 
     # Fill/pipeline knobs default to the env-configured best config; explicit args win.
-    _dma, _stages, _spread = _resolve_dma_opts(bool(swap_gather))
+    _dma, _stages = _resolve_dma_opts(bool(swap_gather))
     if dma_swizzle is not None:
         _dma = bool(dma_swizzle)
         _stages = _stages if _dma else 2
-        _spread = _spread if _dma else False
     if pipe_stages is not None:
         _stages = int(pipe_stages)
-    if spread_dma is not None:
-        _spread = bool(spread_dma)
 
     exe = compile_moe_wgrad_v2(
         dtype="bf16",
@@ -146,7 +138,6 @@ def flydsl_moe_wgrad(
         swap_gather=bool(swap_gather),
         dma_swizzle=_dma,
         pipe_stages=_stages,
-        spread_dma=_spread,
     )
 
     _run_compiled(
@@ -166,9 +157,8 @@ def flydsl_moe_wgrad(
     )
 
 
-# Tile configs the autotuner sweeps (block_n, block_k, warps_n, warps_k). Mirrors the
-# set in op_tests/flydsl_tests/bench_moe_wgrad_flydsl_v2.py; configs that violate the
-# compile-time shape constraints for a given problem are skipped by the tuner.
+# Tile configs the autotuner sweeps (block_n, block_k, warps_n, warps_k). Fill path
+# (DMA+swizzle, 3-stage) is fixed at the env defaults above -- only tile geometry is tuned.
 _AUTOTUNE_TILES = [
     (64, 64, 1, 1),
     (128, 64, 1, 1),
@@ -206,7 +196,7 @@ def _wgrad_run(
     the same mode the production launch will run (the best tile depends on it -- the DMA
     3-stage path favors the large 256x256 tile).
     """
-    _dma, _stages, _spread = _resolve_dma_opts(False)
+    _dma, _stages = _resolve_dma_opts(False)
     exe = compile_moe_wgrad_v2(
         dtype="bf16",
         block_n=int(block_n),
@@ -215,7 +205,6 @@ def _wgrad_run(
         warps_k=int(warps_k),
         dma_swizzle=_dma,
         pipe_stages=_stages,
-        spread_dma=_spread,
     )
     _run_compiled(
         exe,
@@ -298,14 +287,8 @@ def flydsl_moe_wgrad_autotuned(
 
     First call for a given ``(x.shape, N, num_experts)`` benchmarks every tile in
     ``_AUTOTUNE_TILES`` and caches the fastest (in-memory + on disk under
-    ``~/.flydsl/autotune/``); later calls reuse it with no benchmarking overhead.
-
-    ``accumulate``/``out_dtype``/``swap_gather`` are forwarded to the kernel (see
-    :func:`flydsl_moe_wgrad`). For the plain overwrite-bf16, non-swap case the autotuner both
-    benchmarks and launches directly into ``dw`` (idempotent, no ``reset_to_zero`` needed).
-    Otherwise the tile is selected on a scratch buffer and the chosen config is launched with the
-    requested epilogue into ``dw`` -- so tuning never corrupts the real accumulation target. The
-    tile geometry is independent of the epilogue/gather mode, so the shared cache is reused.
+    ``~/.flydsl/autotune/``). The production DMA+swizzle fill path is always used; only
+    tile geometry is swept.
     """
     num_experts, N, K = dw.shape
 
