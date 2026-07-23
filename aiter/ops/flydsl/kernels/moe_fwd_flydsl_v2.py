@@ -240,7 +240,10 @@ def compile_moe_gemm1(
     # the in-flight DMA write(buf_other) and drop the conservative ``s_waitcnt vmcnt(0)``
     # it otherwise plants in front of the operand reads (the dynamic ``it % NUM_BUF`` ring
     # defeated that analysis and serialized the DMA -- see the ATT waitcnt-bound trace).
-    NUM_BUF = 2
+    # The DMA path runs a distance-2, 3-buffer ring (K-loop unrolled by 3): sub-tile g reads
+    # buf g and prefetches tile g+2 into buf (g+2)%3, so each tile's DMA streams under two
+    # MFMA bursts. The register path keeps the classic 2-buffer ping/pong.
+    NUM_BUF = 3 if use_dma else 2
 
     if use_swz:
         for _S in (SA, SB):
@@ -468,7 +471,13 @@ def compile_moe_gemm1(
                 )
 
             def dma_a(k_idx, buf_i32):
-                buf_idx = arith.index_cast(T.index, buf_i32)
+                # Unconditional DMA: `arow_base` already clamps invalid (padding) tokens to
+                # row 0, so every lane issues exactly one `buffer_load...lds` from a valid
+                # address. Padding rows load garbage, but the epilogue store is gated by
+                # `token_ok` (store_ok = token_ok & col_ok) so that garbage is never written
+                # to C, and MFMA is row-independent so it can't leak into valid outputs.
+                # Keeping the op count data-independent (A_FILLS per tile) is what lets the
+                # distance-2 pipeline use a *compile-time-constant* graduated vmcnt(keep).
                 for i, (arow_base, token_ok, row_idx, feat_idx, row_i32, feat_i32) in enumerate(a_desc):
                     # Bake the LDS swizzle into the global K-column so the lane-contiguous
                     # DMA fill physically matches the swizzled `_swz_elem` read (A: row=m, col=k).
@@ -478,17 +487,7 @@ def compile_moe_gemm1(
                         gcol = feat_idx
                     voff_b = arith.index_cast(T.i32, arow_base + k_idx + gcol) * fx.Int32(2)
                     lds_ptr = _dma_wave_ptr(a_lds_off, i, buf_i32)
-                    aif = scf.IfOp(token_ok, results_=[], has_else=True)
-                    with ir.InsertionPoint(aif.then_block):
-                        _dma(a_rsrc, lds_ptr, voff_b)
-                        scf.YieldOp([])
-                    with ir.InsertionPoint(aif.else_block):
-                        vector.store(
-                            zero_v, a_lds,
-                            [buf_idx + row_idx * arith.index(SA) + feat_idx],
-                            alignment=16,
-                        )
-                        scf.YieldOp([])
+                    _dma(a_rsrc, lds_ptr, voff_b)
 
             def dma_b(t, k_idx, buf_i32):
                 for i, (base, r_idx, feat_idx, r_i32, feat_i32) in enumerate(b_desc[t]):
@@ -644,22 +643,30 @@ def compile_moe_gemm1(
             acc_ty = T.vec(C_FRAG, f32)
 
             if const_expr(use_dma):
-                # ---- DMA path: static ping/pong, K-loop unrolled by 2 ----
-                # Each physical iteration processes two contraction sub-tiles. The read
-                # buffer (0/1) and the DMA-write buffer (1/0) are *Python constants*, so
-                # every LDS address is a compile-time-constant offset. The backend can then
-                # prove read(buf_cur) does not alias the in-flight DMA write(buf_other) and
-                # keeps the next sub-tile's global->LDS DMA streaming under the current
-                # sub-tile's ds_read + MFMA, instead of the ``s_waitcnt vmcnt(0)`` drain the
-                # dynamic ``it % NUM_BUF`` ring forced in front of the reads.
+                # ---- DMA path: static 3-buffer ring, distance-2, K-loop unrolled by 3 ----
+                # Each physical iteration processes three contraction sub-tiles. Unrolling by
+                # NUM_BUF (=3) makes every sub-tile's read/write buffer a *Python constant*
+                # (sub-tile j always reads buffer j), so every LDS address is a compile-time
+                # offset and the backend can prove read(buf j) never aliases the in-flight DMA
+                # write(buf j+2). With distance-2 prefetch, sub-tile g issues the DMA for tile
+                # g+2 (consumed two sub-tiles later), so each tile's global->LDS DMA streams
+                # under *two* MFMA bursts before it is read.
+                #
+                # The graduated ``s_waitcnt vmcnt(PER_TILE_DMA)`` at every sub-tile keeps only
+                # the just-issued tile's DMA in flight and drains the older one (the tile the
+                # *next* sub-tile reads). PER_TILE_DMA is a compile-time constant only because
+                # dma_a/dma_b issue a data-independent op count per tile -- hence the
+                # unconditional dma_a above.
+                PER_TILE_DMA = A_FILLS + N_BT * B_FILLS
                 blk = arith.index(block_k)
                 blk2 = arith.index(2 * block_k)
+                blk3 = arith.index(3 * block_k)
                 k_i32 = fx.Int32(arith.index_cast(T.i32, K_idx))
                 ntiles = k_i32 // fx.Int32(block_k)
-                # Main-loop end rounded down to a whole number of 2-tile pairs; a trailing
-                # odd tile (if any) is handled by the runtime tail below.
-                pair_end = arith.index_cast(
-                    T.index, (ntiles // fx.Int32(2)) * fx.Int32(2 * block_k)
+                # Main-loop end rounded down to a whole number of 3-tile groups; a trailing
+                # 1 or 2 tiles (if any) are handled by the runtime tail below.
+                trip_end = arith.index_cast(
+                    T.index, (ntiles // fx.Int32(3)) * fx.Int32(3 * block_k)
                 )
 
                 def _clamp_k(kv):
@@ -675,42 +682,53 @@ def compile_moe_gemm1(
                         dma_b(t, kc, b_buf_i32(t, fx.Int32(wbuf)))
 
                 def _sub_tile(rbuf, wbuf, k_pf, accs, do_pf):
-                    # Read constant buffer ``rbuf``; the next tile's DMA into constant buffer
+                    # Read constant buffer ``rbuf``; the tile-two-ahead DMA into constant buffer
                     # ``wbuf`` is issued *inside* compute, after the operand reads (reads-first
                     # schedule), so it overlaps the MFMA burst without forcing a vmcnt(0) drain
-                    # in front of the reads. The inline-asm barrier then drains it before the
-                    # next sub-tile reads ``wbuf``.
+                    # in front of the reads. The graduated barrier then drains everything except
+                    # the just-issued tile before the next sub-tile reads its buffer.
                     a_cur = a_buf_elem(fx.Int32(rbuf))
                     b_cur = [b_buf_elem(t, fx.Int32(rbuf)) for t in range_constexpr(N_BT)]
                     pf = (lambda: _dma_tile(k_pf, wbuf)) if const_expr(do_pf) else None
                     new = compute(accs, a_cur, b_cur, dma_prefetch=pf)
-                    _dma_barrier(0)
+                    _dma_barrier(PER_TILE_DMA if const_expr(do_pf) else 0)
                     return new
 
-                # Prologue: stage tile 0 into buf0, full drain.
+                # Prologue: stage the first two tiles (distance-2) into buf0, buf1; full drain.
                 _dma_tile(c0, 0)
+                _dma_tile(blk, 1)
                 _dma_barrier()
 
-                loop = scf.ForOp(c0, pair_end, blk2, iter_args=acc_init)
+                loop = scf.ForOp(c0, trip_end, blk3, iter_args=acc_init)
                 with ir.InsertionPoint(loop.body):
                     k_base = loop.induction_variable
                     accs = [loop.body.arguments[1 + i] for i in range(NACC)]
-                    # sub-tile 0: read buf0, prefetch tile k_base+block_k  -> buf1
-                    accs = _sub_tile(0, 1, k_base + blk, accs, True)
-                    # sub-tile 1: read buf1, prefetch tile k_base+2*block_k -> buf0
-                    accs = _sub_tile(1, 0, k_base + blk2, accs, True)
+                    # sub-tile j reads buf j (tile 3p+j), prefetches tile 3p+j+2 -> buf (j+2)%3
+                    accs = _sub_tile(0, 2, k_base + blk2, accs, True)
+                    accs = _sub_tile(1, 0, k_base + blk3, accs, True)
+                    accs = _sub_tile(2, 1, k_base + blk3 + blk, accs, True)
                     scf.YieldOp(accs)
                 accs = [loop.results[i] for i in range(NACC)]
 
-                # Tail: odd tile count -> one more tile, already prefetched into buf0 by the
-                # last pair's sub-tile 1. K is workgroup-uniform, so the branch is uniform.
-                has_tail = arith.cmpi(arith.CmpIPredicate.ult, pair_end, K_idx)
-                tail = scf.IfOp(has_tail, results_=[acc_ty] * NACC, has_else=True)
-                with ir.InsertionPoint(tail.then_block):
-                    scf.YieldOp(_sub_tile(0, 1, c0, accs, False))
-                with ir.InsertionPoint(tail.else_block):
+                # Tail: 0, 1 or 2 leftover tiles, already prefetched into buf0 (and buf1) by the
+                # last group. Drain any DMA still in flight first, then consume without further
+                # prefetch. K is workgroup-uniform, so both branches are uniform.
+                _dma_barrier()
+                rem = ntiles - (ntiles // fx.Int32(3)) * fx.Int32(3)
+                has1 = arith.cmpi(arith.CmpIPredicate.uge, rem, fx.Int32(1))
+                has2 = arith.cmpi(arith.CmpIPredicate.uge, rem, fx.Int32(2))
+                t1 = scf.IfOp(has1, results_=[acc_ty] * NACC, has_else=True)
+                with ir.InsertionPoint(t1.then_block):
+                    a1 = _sub_tile(0, 0, c0, accs, False)
+                    t2 = scf.IfOp(has2, results_=[acc_ty] * NACC, has_else=True)
+                    with ir.InsertionPoint(t2.then_block):
+                        scf.YieldOp(_sub_tile(1, 0, c0, a1, False))
+                    with ir.InsertionPoint(t2.else_block):
+                        scf.YieldOp(a1)
+                    scf.YieldOp([t2.results[i] for i in range(NACC)])
+                with ir.InsertionPoint(t1.else_block):
                     scf.YieldOp(accs)
-                accs = [tail.results[i] for i in range(NACC)]
+                accs = [t1.results[i] for i in range(NACC)]
             else:
                 # ---- Register path: 2-buffer ping/pong (global->VGPR->ds_write) ----
                 store_a(gather_a(c0), a_buf_elem(fx.Int32(0)))

@@ -79,13 +79,14 @@ def _pick_warps(block_m: int, block_n: int, block_k: int):
 
 
 def _fwd_buffering():
-    """(num_buffers, lds_pad) implied by the MOE_FWD_* env, mirroring the v2 kernel: both
-    the DMA (static ping/pong, K-loop unrolled by 2) and register paths use 2 LDS buffers;
-    swizzle/DMA drop the pad for a power-of-two stride."""
+    """(num_buffers, lds_pad) implied by the MOE_FWD_* env, mirroring the v2 kernel: the DMA
+    path runs a distance-2, 3-buffer ring (K-loop unrolled by 3) so it uses 3 LDS buffers;
+    the register path keeps the classic 2-buffer ping/pong. swizzle/DMA drop the pad for a
+    power-of-two stride."""
     use_dma = os.environ.get("MOE_FWD_DMA", "").strip().lower() in ("1", "dma", "on")
     swz = os.environ.get("MOE_FWD_SWZ", "").strip().lower() not in ("0", "off", "false", "no")
     pad = 0 if (use_dma or swz) else _LDS_PAD
-    return 2, pad
+    return (3 if use_dma else 2), pad
 
 
 def _lds_bytes(block_m, block_n, block_k, gated, transpose_b=False):
