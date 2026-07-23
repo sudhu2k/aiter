@@ -185,6 +185,7 @@ def _wgrad_run(
     K,
     num_recv_tokens,
     num_experts,
+    swap_gather=False,
     block_n=128,
     block_k=128,
     warps_n=2,
@@ -194,15 +195,18 @@ def _wgrad_run(
 
     Uses the env-configured fill/pipeline defaults so the tile sweep is benchmarked in
     the same mode the production launch will run (the best tile depends on it -- the DMA
-    3-stage path favors the large 256x256 tile).
+    3-stage path favors the large 256x256 tile). ``swap_gather`` must match the production
+    launch: it flips which operand carries the token-gather, so tuning it in the wrong mode
+    route-walks the compact operand out of bounds (FC2 has ``routes`` >> ``num_recv_tokens``).
     """
-    _dma, _stages = _resolve_dma_opts(False)
+    _dma, _stages = _resolve_dma_opts(bool(swap_gather))
     exe = compile_moe_wgrad_v2(
         dtype="bf16",
         block_n=int(block_n),
         block_k=int(block_k),
         warps_n=int(warps_n),
         warps_k=int(warps_k),
+        swap_gather=bool(swap_gather),
         dma_swizzle=_dma,
         pipe_stages=_stages,
     )
@@ -233,12 +237,13 @@ def _get_autotuner(warmup=10, rep=30):
             Config(block_n=bn, block_k=bk, warps_n=wn, warps_k=wk)
             for (bn, bk, wn, wk) in _AUTOTUNE_TILES
         ]
-        # Key on the GEMM problem: x.shape=(num_recv_tokens, K), grad-feature N, and the
-        # expert count. dtypes of tensor args are folded in automatically by the tuner.
+        # Key on the GEMM problem: x.shape=(num_recv_tokens, K), grad-feature N, the
+        # expert count, and the gather mode (FC1 vs FC2 route/token operand swap). dtypes
+        # of tensor args are folded in automatically by the tuner.
         _wgrad_autotuner = Autotuner(
             _wgrad_run,
             configs,
-            key=["x", "N", "num_experts"],
+            key=["x", "N", "num_experts", "swap_gather"],
             warmup=warmup,
             rep=rep,
         )
@@ -247,7 +252,7 @@ def _get_autotuner(warmup=10, rep=30):
 
 def _select_wgrad_config(
     x, grad, sorted_slot_ids, block_start, blocks_per_expert, route_start,
-    N, K, num_recv_tokens, num_experts,
+    N, K, num_recv_tokens, num_experts, swap_gather=False,
 ):
     """Return the autotuned ``(block_n, block_k, warps_n, warps_k)`` for this problem.
 
@@ -260,7 +265,7 @@ def _select_wgrad_config(
     scratch = torch.empty(num_experts, N, K, device=x.device, dtype=torch.bfloat16)
     args = (
         scratch, x, grad, sorted_slot_ids, block_start, blocks_per_expert, route_start,
-        int(N), int(K), int(num_recv_tokens), int(num_experts),
+        int(N), int(K), int(num_recv_tokens), int(num_experts), bool(swap_gather),
     )
     key = tuner._make_key(args, {})
     if key not in tuner.cache:
@@ -314,7 +319,7 @@ def flydsl_moe_wgrad_autotuned(
 
     block_n, block_k, warps_n, warps_k = _select_wgrad_config(
         x, grad, sorted_slot_ids, block_start, blocks_per_expert, route_start,
-        N, K, num_recv_tokens, num_experts,
+        N, K, num_recv_tokens, num_experts, swap_gather=swap_gather,
     )
     flydsl_moe_wgrad(
         x,
