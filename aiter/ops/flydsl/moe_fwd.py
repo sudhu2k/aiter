@@ -97,13 +97,16 @@ def _fwd_buffering():
     return (3 if use_dma else 2), pad
 
 
-def _lds_bytes(block_m, block_n, block_k, gated, transpose_b=False):
+def _lds_bytes(block_m, block_n, block_k, gated, transpose_b=False, gated_a=False):
     n_bt = 2 if gated else 1
     nbuf, pad = _fwd_buffering()
     a_tile = block_m * (block_k + pad)
+    # Hybrid gated_a DMA path stages the raw ``up`` half in a parallel A tile (2x A LDS).
+    hybrid_a = gated_a and _env_flag("MOE_FWD_DMA", True) and _env_flag("MOE_FWD_GATEDA_DMA", False)
+    a_tiles = 2 if hybrid_a else 1
     # dgrad stages B as [k, n] (row stride = block_n+pad); fwd as [n, k] (block_k+pad).
     b_tile = block_k * (block_n + pad) if transpose_b else block_n * (block_k + pad)
-    return (a_tile + n_bt * b_tile) * nbuf * 2
+    return (a_tiles * a_tile + n_bt * b_tile) * nbuf * 2
 
 
 def _default_block_n(block_m, block_k, gated, transpose_b=False):
@@ -155,15 +158,19 @@ def flydsl_moe_fwd(
     activation: Optional[str] = None,
     dispatched_probs: Optional[torch.Tensor] = None,
     preact_out: Optional[torch.Tensor] = None,
+    gated_a: bool = False,
 ) -> None:
     """Route-list gather-GEMM forward, writing the compact ``C[em_max, WIDTH_N]`` in place.
 
     ``A`` is ``[*, K]`` (received-token acts, gathered by ``sorted_slot_ids`` when
     ``index_a_by_route_pos=False``, else read at the compact route row). ``B`` is
     ``[num_experts, N_OUT, K]`` (contiguous inner ``K``). With ``activation`` set the fused
-    **gated** epilogue applies ``act(gate) * up`` over ``N_OUT = 2F`` into the ``F``-wide ``C``;
-    ``dispatched_probs`` multiplies the per-route prob after the activation, and ``preact_out``
-    (``[em_max, 2F]``) saves the raw ``[gate | up]`` pre-activation.
+    **gated** epilogue (FC1, ``gated_a=False``) applies ``act(gate) * up`` over ``N_OUT = 2F``
+    into the ``F``-wide ``C``; ``dispatched_probs`` multiplies the per-route prob after the
+    activation, and ``preact_out`` (``[em_max, 2F]``) saves the raw ``[gate | up]``
+    pre-activation. With ``gated_a=True`` (FC2) ``A`` is the raw ``[gate | up]`` pre-activation
+    (width ``2F``), the prologue applies ``act(gate) * up [* prob]`` into an ``F``-wide tile,
+    and the GEMM contracts over ``K = F`` against ``B[e, H, F]``.
     """
     assert A.dtype == B.dtype == C.dtype == torch.bfloat16
     assert A.stride(1) == 1, "A must be contiguous along the contraction (K)"
@@ -173,9 +180,14 @@ def flydsl_moe_fwd(
         assert B.stride(1) == 1, "transposed B must be contiguous along N (dgrad view)"
         assert activation is None, "dgrad (transposed B) does not support fused activation"
 
-    gated = activation is not None
+    gated = activation is not None and not gated_a
+    if gated_a:
+        if activation is None:
+            raise ValueError("gated_a requires activation ('silu' or 'gelu')")
+        if not index_a_by_route_pos:
+            raise ValueError("gated_a requires index_a_by_route_pos=True")
     if block_n is None:
-        block_n = _default_block_n(block_m, block_k, gated, transpose_b)
+        block_n = _default_block_n(block_m, block_k, gated or gated_a, transpose_b)
 
     if warps_m is not None and warps_n is not None:
         warps_m, warps_n = int(warps_m), int(warps_n)
@@ -185,17 +197,21 @@ def flydsl_moe_fwd(
             raise ValueError(f"no valid warp layout for block_m={block_m} block_n={block_n}")
         warps_m, warps_n = warps
 
-    N_OUT = int(B.shape[1])
     K = int(B.shape[2])
+    N_OUT = int(B.shape[1])
     width_n = int(C.shape[1])
     if gated and N_OUT != 2 * width_n:
         raise ValueError(f"gated fwd expects N_OUT == 2*C.width, got {N_OUT} vs {width_n}")
+    if gated_a and A.shape[1] != 2 * K:
+        raise ValueError(
+            f"gated_a expects A width == 2*B.K (2F preact), got A={A.shape[1]} vs 2*{K}"
+        )
 
     mul_prob = dispatched_probs is not None
     save_preact = preact_out is not None
     if save_preact and not gated:
-        raise ValueError("preact_out requires a fused activation")
-    act_id = _ACT_IDS[activation] if gated else ACT_SILU
+        raise ValueError("preact_out requires the FC1 gated epilogue (not gated_a)")
+    act_id = _ACT_IDS[activation] if (gated or gated_a) else ACT_SILU
 
     probs = dispatched_probs
     if mul_prob:
@@ -227,6 +243,7 @@ def flydsl_moe_fwd(
         warps_m=int(warps_m),
         warps_n=int(warps_n),
         gated=bool(gated),
+        gated_a=bool(gated_a),
         activation=int(act_id),
         mul_prob=bool(mul_prob),
         save_preact=bool(save_preact),
@@ -262,12 +279,37 @@ def flydsl_moe_fwd(
 
 # Tile/warp configs the autotuner sweeps: (block_n, block_k, warps_m, warps_n). Fill path
 # (DMA+swizzle, 3-buffer) is fixed at the env defaults above -- only tile geometry is tuned.
+#
+# Two shapes matter for the wide-M (block_m=256) MoE cases, where every block_k=128 and
+# 256x64 entry below is filtered out by the LDS limit, leaving only 128x64 candidates:
+#   * a square-ish w4x4 warp grid, which spreads the cooperative A-fill (2 fills) / B-fill
+#     (1 fill) DMA and the LDS fragment reads more evenly than the tall w8x2 layout;
+#   * block_n=256 with block_k=32, which fits LDS at 3 buffers and raises arithmetic
+#     intensity to block_m*block_n/(2*(block_m+block_n)) = 64 MAC/byte vs 42.7 at block_n=128
+#     (the ratio is independent of block_k, so widening N is what pays).
+# Measured on FC1 no-act (qwen235b, block_m=256), idle machine, alias scopes on:
+# 256x32 w4x4 ~1628us, 128x64 w4x4 ~1694us, 128x64 w8x2 ~1726us.
+#
+# An exhaustive sweep of the valid space (all block_n in 64..512 x block_k in 32..256 x warp
+# grids >=4 waves; benchmarks/microbenchmarks/sweep_fc1_configs.py) found nothing better, so
+# the list below is not missing a winner. Two directions are dead ends and are deliberately
+# absent: block_n>=384 costs 4-22x (per-wave accumulator spill plus 120-144KB LDS pinning
+# occupancy to 1 workgroup), and trading block_m down to reach block_k=128 -- 4x fewer
+# barriers, which the ATT trace makes look attractive -- costs 59% (2581us at block_m=128
+# bk=128) because arithmetic intensity falls faster than barrier count. Note block_k>=128 does
+# not fit LDS at all once NUM_BUF>=3, which the kernel enforces.
+#
+# Do not add 256x384x32 w1x4 or 512x32 w1x4 / w2x2: they abort the backend outright
+# ("Bad machine code: Virtual register defs don't dominate all uses"), which would take the
+# autotuner down with them rather than being skipped. Pre-existing, unrelated to alias scopes.
 _FWD_TUNE_CONFIGS = [
     (64, 64, 2, 2),
     (128, 64, 2, 2),
     (128, 64, 4, 2),
     (128, 64, 2, 4),
+    (128, 64, 4, 4),
     (128, 64, 8, 2),
+    (256, 32, 4, 4),
     (256, 64, 4, 2),
     (128, 128, 2, 2),
     (128, 128, 4, 2),
@@ -279,12 +321,12 @@ _FWD_TUNE_CONFIGS = [
 _FWD_CACHE: dict = {}
 
 
-def _valid_config(block_m, bn, bk, wm, wn, K, gated):
+def _valid_config(block_m, bn, bk, wm, wn, K, gated, gated_a=False):
     if K % bk != 0 or bn % _WMMA != 0:
         return False
     if not _warp_valid(block_m, bn, bk, wm, wn):
         return False
-    return _lds_bytes(block_m, bn, bk, gated) <= _LDS_LIMIT
+    return _lds_bytes(block_m, bn, bk, gated, gated_a=gated_a) <= _LDS_LIMIT
 
 
 def flydsl_moe_fwd_autotuned(
@@ -303,6 +345,7 @@ def flydsl_moe_fwd_autotuned(
     activation: Optional[str] = None,
     dispatched_probs: Optional[torch.Tensor] = None,
     preact_out: Optional[torch.Tensor] = None,
+    gated_a: bool = False,
     warmup: int = 3,
     iters: int = 10,
 ) -> None:
@@ -312,11 +355,11 @@ def flydsl_moe_fwd_autotuned(
     ``_FWD_TUNE_CONFIGS`` is benchmarked and the fastest ``(block_n, block_k, warps_m, warps_n)``
     is cached. The production DMA+swizzle fill path is always used; only tile geometry is swept.
     """
-    gated = activation is not None
+    gated = activation is not None and not gated_a
     N_OUT, K = int(B.shape[1]), int(B.shape[2])
     width_n = int(C.shape[1])
     key = (
-        int(block_m), N_OUT, K, width_n, bool(gated),
+        int(block_m), N_OUT, K, width_n, bool(gated), bool(gated_a),
         activation, dispatched_probs is not None, preact_out is not None,
         bool(index_a_by_route_pos),
     )
@@ -327,6 +370,7 @@ def flydsl_moe_fwd_autotuned(
             num_recv_tokens=num_recv_tokens, block_m=block_m, block_n=bn, block_k=bk,
             warps_m=wm, warps_n=wn, index_a_by_route_pos=index_a_by_route_pos,
             activation=activation, dispatched_probs=dispatched_probs, preact_out=preact_out,
+            gated_a=gated_a,
         )
 
     best = _FWD_CACHE.get(key)
@@ -334,7 +378,7 @@ def flydsl_moe_fwd_autotuned(
         candidates = [
             (bn, bk, wm, wn)
             for (bn, bk, wm, wn) in _FWD_TUNE_CONFIGS
-            if _valid_config(block_m, bn, bk, wm, wn, K, gated)
+            if _valid_config(block_m, bn, bk, wm, wn, K, gated, gated_a)
         ]
         if not candidates:
             _launch(None, block_k, None, None)  # heuristic fallback

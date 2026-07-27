@@ -36,8 +36,8 @@ Unlike the wgrad kernel, the contraction axis (``K`` = ``in_features``) is the *
 inner dim of both ``A`` and ``B``, so it maps directly onto the MFMA per-lane K-fragment: the
 LDS tiles are staged as ``[row, k]`` and read back with a plain ``ds_read`` (no transpose).
 
-Fused gated-activation epilogue (matches the Triton contract)
-------------------------------------------------------------
+Fused gated-activation epilogue (FC1, ``GATED``)
+------------------------------------------------
 When ``GATED`` the GEMM output width is the gate+up width ``N_OUT = 2F``; the kernel computes
 two ``[BLOCK_M, BLOCK_N]`` accumulators from a shared ``A`` tile -- one over the gate columns
 ``[0, F)`` and one over the up columns ``[F, 2F)`` -- so the matching (gate, up) pair for an
@@ -45,6 +45,14 @@ output feature lands in the *same lane* (no cross-lane shuffle). The epilogue em
 ``act(gate) * up`` (``act`` = silu/gelu) into the ``F``-wide ``C``; ``MUL_PROB`` multiplies the
 per-route gating prob in *after* the activation; ``SAVE_PREACT`` also stores the raw ``2F``
 ``[gate | up]`` pre-activation for the backward.
+
+Fused gated-activation prologue (FC2, ``GATED_A``)
+--------------------------------------------------
+When ``GATED_A`` the ``A`` operand is the raw ``2F`` pre-activation ``[gate | up]`` (route
+layout, ``index_a_by_route_pos=True``). Before the MFMA the gather stage loads matching
+``(gate[k], up[k])`` pairs, applies ``act(gate) * up`` (and ``MUL_PROB`` when set), and stages
+the resulting ``F``-wide tile into LDS. ``K`` is the contracted ``F`` width; ``B`` is
+``[E, H, F]``. This lets FC1 emit raw ``2F`` only and moves activation (+ route prob) to FC2.
 
 Supported: bf16, contiguous-inner ``A``/``B`` (``stride_ak == stride_bk == 1``), both
 ``INDEX_A_BY_ROUTE_POS`` modes (FC1 fwd gather, FC2 fwd route-read). The transposed-weight
@@ -59,6 +67,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import builtin as _builtin
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
@@ -157,6 +166,23 @@ def _act_f32(g, act: int):
     return arith.mulf(half_g, arith.addf(one, tanh))
 
 
+def _gated_a_bf16_vec8(gate_v, up_v, prob, act: int, *, mul_prob: bool):
+    """``act(gate) * up [* prob]`` elementwise over an 8-wide bf16 vector (FC2 A prologue)."""
+    bf16 = T.bf16
+    f32 = T.f32
+    out_elems = []
+    for i in range_constexpr(FILL_V):
+        g = vector.extract(gate_v, static_position=[i], dynamic_position=[])
+        u = vector.extract(up_v, static_position=[i], dynamic_position=[])
+        gf = arith.extf(f32, g)
+        uf = arith.extf(f32, u)
+        val = arith.mulf(_act_f32(gf, act), uf)
+        if mul_prob:
+            val = arith.mulf(val, prob)
+        out_elems.append(arith.truncf(bf16, val))
+    return vector.from_elements(T.vec(FILL_V, bf16), out_elems)
+
+
 @functools.lru_cache(maxsize=None)
 def compile_moe_gemm1(
     *,
@@ -167,6 +193,7 @@ def compile_moe_gemm1(
     warps_m: int = 2,
     warps_n: int = 2,
     gated: bool = False,
+    gated_a: bool = False,
     activation: int = ACT_SILU,
     mul_prob: bool = False,
     save_preact: bool = False,
@@ -181,9 +208,13 @@ def compile_moe_gemm1(
         raise ValueError(f"block_k must be a multiple of {WMMA_K}")
     if save_preact and not gated:
         raise ValueError("save_preact requires gated activation")
-    if transpose_b and gated:
-        # dgrad (transposed weights) is never gated; keep the two epilogues decoupled.
-        raise ValueError("transpose_b (dgrad) does not support the gated epilogue")
+    if gated and gated_a:
+        raise ValueError("gated (FC1 epilogue) and gated_a (FC2 prologue) are mutually exclusive")
+    if transpose_b and (gated or gated_a):
+        # dgrad (transposed weights) is never gated; keep the epilogues decoupled.
+        raise ValueError("transpose_b (dgrad) does not support fused activation")
+    if gated_a and not index_a_by_route_pos:
+        raise ValueError("gated_a (FC2 prologue) requires index_a_by_route_pos=True")
 
     n_threads = warps_m * warps_n * WARP_SIZE
     if (block_m * block_k) % (n_threads * FILL_V) != 0:
@@ -205,7 +236,77 @@ def compile_moe_gemm1(
             return default
         return v.strip().lower() not in ("0", "off", "false", "no")
 
+    def _env_int(name: str, default: int) -> int:
+        v = os.environ.get(name)
+        return int(v) if v is not None and v.strip() != "" else default
+
     use_dma = _env_on("MOE_FWD_DMA", True)
+    # FC2 gated_a prologue has two fill strategies:
+    #  * register path (default): gather (gate, up) to VGPR, apply act(gate)*up, ds_write to LDS.
+    #  * hybrid DMA path (MOE_FWD_GATEDA_DMA=1): keep the fast global->LDS DMA by staging the raw
+    #    gate and up halves into two parallel LDS tiles, then fuse act(gate)*up on the LDS->VGPR
+    #    read into the MFMA. Route prob is a per-route (M) scalar, so it factors out of the GEMM
+    #    and is applied in the epilogue for *both* paths (out[m,n] *= prob[m]).
+    hybrid_a = gated_a and use_dma and _env_on("MOE_FWD_GATEDA_DMA", False)
+    # Experiment: emit the DMA barrier as ROCDL s_waitcnt/s_barrier intrinsics rather than an
+    # inline-asm blob, so SIInsertWaitcnts can see the wait instead of treating it as opaque.
+    _WAITCNT_INTRINSIC = _env_on("MOE_FWD_WAITCNT_INTRINSIC", False)
+    # Experiment: build the global->LDS DMA destination as a GEP off the @smem object instead
+    # of inttoptr(readfirstlane(byte_off)), giving it provenance the aliasing analysis can use.
+    _DMA_GEP = _env_on("MOE_FWD_DMA_GEP", False)
+    # Per-ring-slot LLVM alias scopes on both the LDS-DMA writes and the LDS operand reads.
+    # ``SIInsertWaitcnts`` only takes its alias-aware LDS-DMA path for a read whose memory
+    # operand carries AA info (``if (Ptr && Memop->getAAInfo())``); otherwise it waits on the
+    # generic "any LDS DMA" slot, which is the blunt ``s_waitcnt vmcnt(0)`` in front of every
+    # operand read. Provenance alone does not supply AA info -- the metadata does. Tagging the
+    # fill of ring slot ``r`` and the read of ring slot ``r`` with the same scope (and noalias
+    # against every other slot) keeps the real same-slot RAW dependency while dropping the
+    # false cross-slot ones, so the pass can emit a graduated vmcnt. The read side must be an
+    # ``llvm.load`` because ``vector.load`` has no alias-metadata operand. Recipe mirrors the
+    # mxfp8 4-wave HK kernels (``flydsl_4wave_hk.py`` / ``kernel_grouped_4wave.py``).
+    # ``transpose_b`` reads B through ``ds_read_tr`` and ``hybrid_a`` reads a second parallel
+    # up-tile; both would need scopes of their own, so they fall back to the unscoped reads
+    # rather than silently mixing a scoped write with an unscoped read (which is still
+    # MayAlias, i.e. no gain, and would make the flag break those configs).
+    #
+    # On by default (opt out with ``MOE_FWD_DMA_ALIAS=0``). ATT on FC1 no-act (qwen235b,
+    # 256x256x32 w4x4) shows the ``s_waitcnt vmcnt`` stall bucket dropping 29.2% -> 8.0% of
+    # stall cycles; the freed cycles are largely reabsorbed by the ds_read/DMA they were
+    # hiding, so the net is ~1.9% (1660us -> 1628us, non-overlapping over 5 interleaved reps).
+    # The gain scales with the number of K iterations, so it is a win at block_k=32 (-2.2%)
+    # and roughly a wash to slightly negative at block_k=64 (+1%), where the two extra VGPRs
+    # the scoped loads cost are not repaid.
+    _DMA_ALIAS = (
+        use_dma and not transpose_b and not hybrid_a and _env_on("MOE_FWD_DMA_ALIAS", True)
+    )
+    if _DMA_ALIAS:
+        # The DMA destination must be a GEP off the LDS object for the fill and the read to
+        # share a base the aliasing analysis can compare.
+        _DMA_GEP = True
+    # Register-path deep VGPR load-ahead: issue the global gather two K-tiles ahead (carried in
+    # VGPRs across the loop) instead of one, so the ``buffer_load`` latency overlaps a full
+    # MFMA+store+barrier cycle rather than only the (short) MFMA burst. Keeps NUM_BUF==2 LDS
+    # buffers (occupancy unchanged); costs one extra tile of gathered VGPRs. For ``gated_a`` the
+    # *raw* gate/up halves are carried and the ``silu(gate)*up`` fuse is deferred to store time,
+    # so the load is not immediately waited on by the activation's vector.extract.
+    reg_pf2 = _env_on("MOE_FWD_REG_PF2", True)
+    # Pipeline the gated_a activation: instead of applying silu(gate)*up as a serial burst in
+    # front of the MFMA (store_a_vecs before compute), emit the per-descriptor silu+ds_write as
+    # thunks interleaved across the MFMA groups inside ``compute`` so the (expensive) v_exp
+    # transcendental co-issues on the VALU while the matrix pipe runs. The activated tile targets
+    # the ``nxt`` LDS buffer (disjoint from the ``cur`` buffer the MFMA reads), so the store is
+    # hazard-free and still lands before the end-of-iteration barrier.
+    #
+    # DEFAULT OFF: measured a net regression (large ~7.5%, qwen235b ~38% slower). ATT confirms the
+    # v_exp *does* overlap (per-wave VALU stall ~halves), but interleaving keeps the carried raw
+    # gate/up VGPRs live across the whole MFMA burst (maxVGPR v57 -> v67), bumping the allocation
+    # bucket and costing ~1 wave/SIMD of occupancy. This kernel is occupancy-bound, so the lost
+    # cross-wave latency hiding outweighs the per-wave gain. Kept as a flag for experimentation.
+    silu_pipe = _env_on("MOE_FWD_SILU_PIPE", False)
+    if gated_a and not hybrid_a:
+        # Paired (gate, up) gathers from the ``[gate | up]`` layout; the plain DMA path assumes a
+        # single contiguous-K staging tile.
+        use_dma = False
     # XOR bank-swizzle replaces LDS_PAD: keeps a power-of-two (unpadded) row stride while
     # staying bank-conflict-free on the transpose read. Implies the DMA path's unpadded layout.
     # Default-on to match the tuned GEMM's unconditional XOR16 swizzle (frees the LDS_PAD row
@@ -245,10 +346,32 @@ def compile_moe_gemm1(
     # the in-flight DMA write(buf_other) and drop the conservative ``s_waitcnt vmcnt(0)``
     # it otherwise plants in front of the operand reads (the dynamic ``it % NUM_BUF`` ring
     # defeated that analysis and serialized the DMA -- see the ATT waitcnt-bound trace).
-    # The DMA path runs a distance-2, 3-buffer ring (K-loop unrolled by 3): sub-tile g reads
-    # buf g and prefetches tile g+2 into buf (g+2)%3, so each tile's DMA streams under two
-    # MFMA bursts. The register path keeps the classic 2-buffer ping/pong.
-    NUM_BUF = 3 if use_dma else 2
+    # The DMA path runs a distance-(NUM_BUF-1), NUM_BUF-buffer ring (K-loop unrolled by NUM_BUF):
+    # sub-tile g reads buf g and prefetches tile g+(NUM_BUF-1) into buf (g+NUM_BUF-1)%NUM_BUF, so
+    # each tile's DMA streams under (NUM_BUF-1) MFMA bursts. Deeper rings (MOE_FWD_DMA_BUF=4) hide
+    # more vmcnt(0) latency, but cost +1 full LDS tile: a compute-efficient tile (e.g. FC1's
+    # 256x128x64) already fills LDS at NUM_BUF==3, so a 4th buffer only fits by shrinking block_k
+    # / block_n, which loses more MFMA throughput than the deeper prefetch recovers. Worth it only
+    # for shapes with LDS headroom at the good tile. The register path keeps the 2-buffer ping/pong.
+    NUM_BUF = max(3, _env_int("MOE_FWD_DMA_BUF", 3)) if use_dma else 2
+
+    # XCD->pid remap for L2 reuse (MI300 has 8 XCDs, each with a private L2). The default
+    # round-robin workgroup->XCD dispatch scatters same-expert m-blocks (which reuse the same
+    # B weight tile) across all 8 XCDs, so each XCD's L2 misses the weight independently -> up
+    # to 8x redundant HBM weight traffic and a cold-miss on first touch. ``xcd_swizzle`` (the
+    # M-major group width) relinearizes (pid_m, pid_n) so a contiguous run of workgroups stays
+    # on one XCD, warming its L2 for the shared weight tile. Mirrors the grouped-MoE
+    # ``mixed_moe_gemm_2stage`` / ``xcd_remap_bx_by`` scheme.
+    #
+    # DEFAULT OFF: measured a consistent regression on FC1 no-act (~9-13% at widths 1..16, worse
+    # at 32) across both the qwen235b and large shapes. The reason is that the *default* dispatch
+    # is already L2-friendly here: HIP launches grid=(gx, gy) x-fastest, so consecutive
+    # workgroups form a full row of n-tiles for one m-block -- they share the gathered A rows and
+    # a single expert's weights (streamed contiguously along N). The M-major XCD regrouping
+    # scatters that natural reuse instead of concentrating it (even width 1 regresses, isolating
+    # the reorder itself as the cost). Kept as a flag for experimentation on shapes where the
+    # default block->tile order is *not* already locality-friendly (opt in with MOE_FWD_XCD=N).
+    xcd_swizzle = max(0, _env_int("MOE_FWD_XCD", 0))
 
     if use_swz:
         for _S in (SA, SB):
@@ -261,16 +384,22 @@ def compile_moe_gemm1(
     KERNEL_NAME = (
         f"moe_fwd_routelist_{dtype}_{block_m}x{block_n}x{block_k}"
         f"_w{warps_m}x{warps_n}"
-        f"{'_gated' if gated else ''}{'_prob' if mul_prob else ''}"
+        f"{'_gated' if gated else ''}{'_gateda' if gated_a else ''}{'_prob' if mul_prob else ''}"
         f"{'_pre' if save_preact else ''}{'_dg' if index_a_by_route_pos else ''}"
         f"{'_tb' if transpose_b else ''}{'_dma' if use_dma else ''}"
         f"{'_swz' if use_swz else ''}"
+        f"{f'_xcd{xcd_swizzle}' if xcd_swizzle > 0 else ''}"
     )
 
     # LDS: NUM_BUF-buffered A tile + (N_BT) NUM_BUF-buffered B tiles (NUM_BUF==2 register).
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem")
     a_lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = a_lds_off + A_TILE * NUM_BUF * 2
+    # Hybrid gated_a: a parallel A tile stages the raw ``up`` half alongside ``gate``.
+    a_up_lds_off = None
+    if hybrid_a:
+        a_up_lds_off = allocator._align(allocator.ptr, 16)
+        allocator.ptr = a_up_lds_off + A_TILE * NUM_BUF * 2
     b_lds_off = allocator._align(allocator.ptr, 16)
     allocator.ptr = b_lds_off + N_BT * B_TILE * NUM_BUF * 2
 
@@ -315,11 +444,49 @@ def compile_moe_gemm1(
 
         base_ptr = allocator.get_base()
         a_lds = SmemPtr(base_ptr, a_lds_off, bf16, shape=(NUM_BUF * A_TILE,)).get()
+        if const_expr(hybrid_a):
+            a_up_lds = SmemPtr(base_ptr, a_up_lds_off, bf16, shape=(NUM_BUF * A_TILE,)).get()
+        else:
+            a_up_lds = None
         b_lds = SmemPtr(base_ptr, b_lds_off, bf16, shape=(N_BT * NUM_BUF * B_TILE,)).get()
 
         tid = fx.Int32(gpu.thread_id("x"))
         pid_n = fx.Int32(gpu.block_id("x"))
         pid_m = fx.Int32(gpu.block_id("y"))
+
+        # XCD->pid remap (L2 reuse). Relinearize (pid_m, pid_n) so a contiguous run of
+        # workgroups lands on the same XCD, keeping the shared B weight tile warm in that
+        # XCD's L2. gx = grid.x (n-tiles), gy = grid.y (m-blocks). The XCD linearization is a
+        # remainder-safe bijection (matches xcd_remap_bx_by); the second stage re-tiles it
+        # M-major in groups of ``xcd_swizzle``, folding the ragged tail group. Must precede the
+        # ``expert = expert_ids[pid_m]`` load below so the remapped block picks its expert.
+        if const_expr(xcd_swizzle > 0):
+            NUM_XCDS = 8
+            gx_i = arith.index_cast(T.index, gpu.grid_dim.x)
+            gy_i = arith.index_cast(T.index, gpu.grid_dim.y)
+            m_i = arith.index_cast(T.index, pid_m)
+            n_i = arith.index_cast(T.index, pid_n)
+            linear_id = m_i * gx_i + n_i
+            num_wgs = gx_i * gy_i
+            c_xcds = arith.index(NUM_XCDS)
+            _q = num_wgs // c_xcds
+            _r = num_wgs % c_xcds
+            _xcd = linear_id % c_xcds
+            _in_xcd = linear_id // c_xcds
+            _clip = arith.cmpi(arith.CmpIPredicate.ult, _xcd, _r).select(_xcd, _r)
+            wgid = _xcd * _q + _clip + _in_xcd
+
+            c_wgm = arith.index(xcd_swizzle)
+            num_in_group = c_wgm * gx_i
+            group_id = wgid // num_in_group
+            first_m = group_id * c_wgm
+            remaining_m = gy_i - first_m
+            group_size_m = arith.cmpi(
+                arith.CmpIPredicate.ult, remaining_m, c_wgm
+            ).select(remaining_m, c_wgm)
+            in_group = wgid % num_in_group
+            pid_m = arith.index_cast(T.i32, first_m + (in_group % group_size_m))
+            pid_n = arith.index_cast(T.i32, in_group // group_size_m)
 
         # Early exit for tail blocks past the padded route extent.
         expert = buffer_load_i32(eid_rsrc, pid_m)
@@ -343,6 +510,10 @@ def compile_moe_gemm1(
             stride_am_idx = arith.index_cast(T.index, stride_am)
             stride_be_idx = arith.index_cast(T.index, stride_be)
             stride_bn_idx = arith.index_cast(T.index, stride_bn)
+            # Route-prob addressing (needed by the FC2 gated_a prologue in ``gather_a`` and by the
+            # FC1 gated epilogue); define once up front so both closures can capture it.
+            e_pm = arith.index_cast(T.index, expert) * arith.index_cast(T.index, stride_pe)
+            stride_pm_idx = arith.index_cast(T.index, stride_pm)
 
             bstart_e = buffer_load_i32(bstart_rsrc, expert)
             rstart_e = buffer_load_i32(rstart_rsrc, expert)
@@ -397,6 +568,23 @@ def compile_moe_gemm1(
                     b_desc[t].append((base, r_idx, feat_idx, r, feat))
 
             def gather_a(k_idx):
+                if const_expr(gated_a):
+                    k_idx_i = arith.index_cast(T.index, k_idx)
+                    k_width = arith.index_cast(T.index, K)
+                    out = []
+                    for (arow_base, ok, rw, feat_idx, row_i32, feat_i32) in a_desc:
+                        # Global A load is always unswizzled (swizzle is applied only when
+                        # storing to LDS via ``_a_lds_elem``), matching the non-gated path.
+                        # Route prob is applied in the epilogue (per-M scalar), not here.
+                        gate_off = arow_base + k_idx_i + feat_idx
+                        up_off = gate_off + k_width
+                        gate_vec = buffer_load_bf16_vec(a_rsrc, gate_off, FILL_V)
+                        up_vec = buffer_load_bf16_vec(a_rsrc, up_off, FILL_V)
+                        act_vec = _gated_a_bf16_vec8(
+                            gate_vec, up_vec, None, activation, mul_prob=False
+                        )
+                        out.append((act_vec, ok, rw, feat_idx))
+                    return out
                 return [
                     (buffer_load_bf16_vec(a_rsrc, ab + k_idx + ft, FILL_V), ok, rw, ft)
                     for (ab, ok, rw, ft, _ri, _fi) in a_desc
@@ -416,6 +604,60 @@ def compile_moe_gemm1(
                         ok.select(vec, zero_v), a_lds,
                         [buf_elem + _a_lds_elem(rw, ft)], alignment=16,
                     )
+
+            # ---- split gather/store for the deep VGPR load-ahead (reg_pf2). ``gather_a_vecs``
+            # only issues the global loads and returns the raw bf16 vectors to carry across the
+            # loop; ``store_a_vecs`` consumes them (fusing silu(gate)*up for gated_a) into LDS.
+            # gated_a carries 2 vecs/desc (gate, up); the plain path carries 1.
+            A_VECS_PER = (2 if gated_a else 1) * len(a_desc)
+
+            def gather_a_vecs(k_idx):
+                k_i = arith.index_cast(T.index, k_idx)
+                vecs = []
+                if const_expr(gated_a):
+                    k_width = arith.index_cast(T.index, K)
+                    for (arow_base, ok, rw, ft, ri, fi) in a_desc:
+                        g = arow_base + k_i + ft
+                        vecs.append(buffer_load_bf16_vec(a_rsrc, g, FILL_V))
+                        vecs.append(buffer_load_bf16_vec(a_rsrc, g + k_width, FILL_V))
+                else:
+                    for (ab, ok, rw, ft, ri, fi) in a_desc:
+                        vecs.append(buffer_load_bf16_vec(a_rsrc, ab + k_i + ft, FILL_V))
+                return vecs
+
+            def store_a_vecs(vecs, buf_elem):
+                for j, (base_or_ab, ok, rw, ft, ri, fi) in enumerate(a_desc):
+                    if const_expr(gated_a):
+                        act = _gated_a_bf16_vec8(
+                            vecs[2 * j], vecs[2 * j + 1], None, activation, mul_prob=False
+                        )
+                        val = ok.select(act, zero_v)
+                    else:
+                        val = ok.select(vecs[j], zero_v)
+                    vector.store(val, a_lds, [buf_elem + _a_lds_elem(rw, ft)], alignment=16)
+
+            def store_a_thunks(vecs, buf_elem):
+                # One thunk per descriptor doing the (optionally gated) activation *and* its
+                # ds_write into ``buf_elem``. Handed to ``compute(act_fill=...)`` so the v_exp and
+                # the LDS store interleave with the MFMA burst instead of preceding it.
+                def make(j):
+                    base_or_ab, ok, rw, ft, ri, fi = a_desc[j]
+
+                    def thunk():
+                        if const_expr(gated_a):
+                            act = _gated_a_bf16_vec8(
+                                vecs[2 * j], vecs[2 * j + 1], None, activation, mul_prob=False
+                            )
+                            val = ok.select(act, zero_v)
+                        else:
+                            val = ok.select(vecs[j], zero_v)
+                        vector.store(
+                            val, a_lds, [buf_elem + _a_lds_elem(rw, ft)], alignment=16
+                        )
+
+                    return thunk
+
+                return [make(j) for j in range_constexpr(len(a_desc))]
 
             def gather_b(t, k_idx):
                 out = []
@@ -443,11 +685,110 @@ def compile_moe_gemm1(
                         [buf_elem + _b_lds_elem(r_idx, feat_idx)], alignment=16,
                     )
 
+            B_VECS_PER = [len(b_desc[t]) for t in range(N_BT)]
+
+            def gather_b_vecs(t, k_idx):
+                vecs = []
+                for base, r_idx, feat_idx, _ri, _fi in b_desc[t]:
+                    if const_expr(transpose_b):
+                        off = base + (k_idx + r_idx) * stride_bk_idx
+                    else:
+                        off = base + k_idx + feat_idx
+                    vecs.append(buffer_load_bf16_vec(b_rsrc, off, FILL_V))
+                return vecs
+
+            def store_b_vecs(t, vecs, buf_elem):
+                for j, (base, r_idx, feat_idx, _ri, _fi) in enumerate(b_desc[t]):
+                    vector.store(
+                        vecs[j], b_lds,
+                        [buf_elem + _b_lds_elem(r_idx, feat_idx)], alignment=16,
+                    )
+
             # ---- async global->LDS DMA fill (buffer_load ... lds). Requires the
             # unpadded (lane-contiguous) LDS layout: with lds_pad==0 the register
             # store address row*S + feat collapses to FILL_V*(tid + i*n_threads),
             # exactly the contiguous lane-order destination the DMA produces. ----
-            def _dma_wave_ptr(lds_off, i, buf_i32):
+            if const_expr(_DMA_GEP):
+                # One shared LDS base pointer, rooted in the real @smem allocation, carrying
+                # the only dynamic (per-wave) displacement. Every DMA destination is then a
+                # GEP off *this* value with a compile-time-constant byte offset, so the fills
+                # are provably disjoint from each other and from the ds_read slices, instead
+                # of each being an anonymous inttoptr the aliasing analysis must assume may
+                # overlap. Mirrors the construction in preshuffle_gemm.py.
+                from flydsl._mlir.dialects import memref as _memref_dialect
+
+                _lds_root = buffer_ops.create_llvm_ptr(
+                    _memref_dialect.extract_aligned_pointer_as_index(base_ptr),
+                    address_space=3,
+                )
+                _wave_byte = wid * fx.Int32(LANE_FILL) * fx.Int32(2)
+                _lds_wave_base = buffer_ops.get_element_ptr(
+                    _lds_root,
+                    rocdl.readfirstlane(
+                        T.i64, arith.index_cast(T.i64, arith.index_cast(T.index, _wave_byte))
+                    ),
+                )
+
+            if const_expr(_DMA_ALIAS):
+                # One alias scope per (operand, ring slot). A fill of slot r and a read of
+                # slot r share a scope, so their RAW dependency survives; every other pair is
+                # marked noalias, which is what lets the waitcnt pass keep the older fills in
+                # flight instead of draining them.
+                _ALIAS_DOMAIN = '#llvm.alias_scope_domain<id = "moe_fwd_lds">'
+                _SCOPE_IDS = tuple(
+                    [f"a{r}" for r in range(NUM_BUF)]
+                    + [f"b{t}_{r}" for t in range(N_BT) for r in range(NUM_BUF)]
+                )
+
+                def _scope_attr(ids):
+                    inner = ", ".join(
+                        f'#llvm.alias_scope<id = "{sid}", domain = {_ALIAS_DOMAIN}>'
+                        for sid in ids
+                    )
+                    return ir.Attribute.parse(f"[{inner}]")
+
+                _MY_SCOPE = {sid: _scope_attr((sid,)) for sid in _SCOPE_IDS}
+                _NOALIAS_SCOPE = {
+                    sid: _scope_attr(tuple(o for o in _SCOPE_IDS if o != sid))
+                    for sid in _SCOPE_IDS
+                }
+
+            def _a_sid(slot):
+                return f"a{slot % NUM_BUF}"
+
+            def _b_sid(t, slot):
+                return f"b{t}_{slot % NUM_BUF}"
+
+            def _scope_kw(sid):
+                """alias/noalias metadata kwargs for one (operand, ring slot), or {}."""
+                if const_expr(not _DMA_ALIAS or sid is None):
+                    return {}
+                return {
+                    "alias_scopes": _MY_SCOPE[sid],
+                    "noalias_scopes": _NOALIAS_SCOPE[sid],
+                }
+
+            def _lds_scoped_load(lds_off, elem_idx, sid):
+                """vec8 bf16 LDS read as an ``llvm.load`` so it can carry alias scopes.
+
+                ``vector.load`` has no alias-metadata operand, and a scoped write against an
+                unscoped read is still MayAlias, so the read has to be lowered by hand here.
+                """
+                byte = arith.index_cast(T.i32, elem_idx) * fx.Int32(2)
+                ptr = buffer_ops.get_element_ptr(
+                    _lds_root, byte_offset=byte, static_byte_offset=lds_off
+                )
+                return _llvm.LoadOp(
+                    T.vec(8, bf16), ptr, alignment=16, **_scope_kw(sid)
+                ).result
+
+            def _dma_wave_ptr(lds_off, i, buf_i32, buf_elem_py=None):
+                if const_expr(_DMA_GEP):
+                    return buffer_ops.get_element_ptr(
+                        _lds_wave_base,
+                        static_byte_offset=lds_off
+                        + (buf_elem_py + i * n_threads * FILL_V) * 2,
+                    )
                 base_elem = (
                     buf_i32 + fx.Int32(i * n_threads * FILL_V)
                     + wid * fx.Int32(LANE_FILL)
@@ -457,11 +798,12 @@ def compile_moe_gemm1(
                 scal = rocdl.readfirstlane(T.i64, byte_i64)
                 return _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), scal).result
 
-            def _dma(rsrc, lds_ptr, voff_b):
+            def _dma(rsrc, lds_ptr, voff_b, sid=None):
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc, lds_ptr, arith.constant(DMA_BYTES, type=T.i32),
                     voff_b, arith.constant(0, type=T.i32),
                     arith.constant(0, type=T.i32), arith.constant(1, type=T.i32),
+                    **_scope_kw(sid),
                 )
 
             def _dma_barrier(keep=0):
@@ -469,13 +811,22 @@ def compile_moe_gemm1(
                 # workgroup barrier (so all waves see the staged tile), retiring this wave's
                 # ds_reads (lgkmcnt) before the buffer is recycled. keep>0 leaves the newest
                 # tiles' DMA streaming across the barrier to overlap the next step's MFMA.
-                asm = f"s_waitcnt vmcnt({keep}) lgkmcnt(0)\ns_barrier"
-                _llvm.InlineAsmOp(
-                    res=None, operands_=[], asm_string=asm,
-                    constraints="", has_side_effects=True, is_align_stack=False,
-                )
+                if const_expr(_WAITCNT_INTRINSIC):
+                    # Same wait, but as ROCDL ops instead of an opaque asm blob, so the
+                    # waitcnt pass can see it. gfx9 simm16 layout:
+                    #   vmcnt[3:0] | expcnt << 4 | lgkmcnt << 8 | vmcnt[5:4] << 14
+                    # expcnt=7 means "do not wait"; lgkmcnt=0 waits for all LDS ops.
+                    imm = (keep & 0xF) | (7 << 4) | (((keep >> 4) & 0x3) << 14)
+                    rocdl.s_waitcnt(imm)
+                    rocdl.s_barrier()
+                else:
+                    asm = f"s_waitcnt vmcnt({keep}) lgkmcnt(0)\ns_barrier"
+                    _llvm.InlineAsmOp(
+                        res=None, operands_=[], asm_string=asm,
+                        constraints="", has_side_effects=True, is_align_stack=False,
+                    )
 
-            def dma_a(k_idx, buf_i32):
+            def dma_a(k_idx, buf_i32, buf_py=None):
                 # Unconditional DMA: `arow_base` already clamps invalid (padding) tokens to
                 # row 0, so every lane issues exactly one `buffer_load...lds` from a valid
                 # address. Padding rows load garbage, but the epilogue store is gated by
@@ -491,10 +842,19 @@ def compile_moe_gemm1(
                     else:
                         gcol = feat_idx
                     voff_b = arith.index_cast(T.i32, arow_base + k_idx + gcol) * fx.Int32(2)
-                    lds_ptr = _dma_wave_ptr(a_lds_off, i, buf_i32)
-                    _dma(a_rsrc, lds_ptr, voff_b)
+                    a_elem_py = None if buf_py is None else buf_py * A_TILE
+                    lds_ptr = _dma_wave_ptr(a_lds_off, i, buf_i32, a_elem_py)
+                    _dma(a_rsrc, lds_ptr, voff_b,
+                         None if buf_py is None else _a_sid(buf_py))
+                    if const_expr(hybrid_a):
+                        # Stage the ``up`` half (column + K) into the parallel tile at the same
+                        # swizzled LDS slot, so read_a_frag can fuse act(gate)*up on the read.
+                        up_off = arow_base + k_idx + gcol + arith.index_cast(T.index, K)
+                        voff_up = arith.index_cast(T.i32, up_off) * fx.Int32(2)
+                        up_ptr = _dma_wave_ptr(a_up_lds_off, i, buf_i32, a_elem_py)
+                        _dma(a_rsrc, up_ptr, voff_up)
 
-            def dma_b(t, k_idx, buf_i32):
+            def dma_b(t, k_idx, buf_i32, buf_py=None):
                 for i, (base, r_idx, feat_idx, r_i32, feat_i32) in enumerate(b_desc[t]):
                     # Bake the LDS swizzle into the global source column of the DMA gather.
                     if const_expr(transpose_b):
@@ -514,18 +874,31 @@ def compile_moe_gemm1(
                             gcol = feat_idx
                         off = base + k_idx + gcol
                     voff_b = arith.index_cast(T.i32, off) * fx.Int32(2)
-                    lds_ptr = _dma_wave_ptr(b_lds_off, i, buf_i32)
-                    _dma(b_rsrc, lds_ptr, voff_b)
+                    b_elem_py = (
+                        None if buf_py is None
+                        else t * NUM_BUF * B_TILE + buf_py * B_TILE
+                    )
+                    lds_ptr = _dma_wave_ptr(b_lds_off, i, buf_i32, b_elem_py)
+                    _dma(b_rsrc, lds_ptr, voff_b,
+                         None if buf_py is None else _b_sid(t, buf_py))
 
-            def read_a_frag(buf_elem, atom_off, kk):
+            def read_a_frag(buf_elem, atom_off, kk, slot=None):
                 row = warp_m_base + atom_off + lane_row
                 col = fx.Int32(kk * WMMA_K) + lane_kg * fx.Int32(8)
                 off = _swz_elem(row, col, SA) if const_expr(use_swz) else row * fx.Int32(SA) + col
                 elem = arith.index_cast(T.index, off)
-                raw = vector.load_op(T.vec(8, bf16), a_lds, [buf_elem + elem])
+                if const_expr(_DMA_ALIAS and slot is not None):
+                    raw = _lds_scoped_load(a_lds_off, buf_elem + elem, _a_sid(slot))
+                else:
+                    raw = vector.load_op(T.vec(8, bf16), a_lds, [buf_elem + elem])
+                if const_expr(hybrid_a):
+                    # Fuse act(gate)*up on the LDS->VGPR read (prob deferred to the epilogue).
+                    raw_up = vector.load_op(T.vec(8, bf16), a_up_lds, [buf_elem + elem])
+                    fused = _gated_a_bf16_vec8(raw, raw_up, None, activation, mul_prob=False)
+                    return fx.Vector(fused, (8,), fx.BFloat16)
                 return fx.Vector(raw, (8,), fx.BFloat16)
 
-            def read_b_frag(buf_elem, atom_off, kk):
+            def read_b_frag(buf_elem, atom_off, kk, slot=None, t=0):
                 if const_expr(transpose_b):
                     buf_byte = arith.index_cast(T.i32, buf_elem) * fx.Int32(2)
                     return _tr_read_frag(
@@ -536,10 +909,13 @@ def compile_moe_gemm1(
                 col = fx.Int32(kk * WMMA_K) + lane_kg * fx.Int32(8)
                 off = _swz_elem(row, col, SB) if const_expr(use_swz) else row * fx.Int32(SB) + col
                 elem = arith.index_cast(T.index, off)
-                raw = vector.load_op(T.vec(8, bf16), b_lds, [buf_elem + elem])
+                if const_expr(_DMA_ALIAS and slot is not None):
+                    raw = _lds_scoped_load(b_lds_off, buf_elem + elem, _b_sid(t, slot))
+                else:
+                    raw = vector.load_op(T.vec(8, bf16), b_lds, [buf_elem + elem])
                 return fx.Vector(raw, (8,), fx.BFloat16)
 
-            def compute(accs, a_buf, b_bufs, dma_prefetch=None):
+            def compute(accs, a_buf, b_bufs, dma_prefetch=None, act_fill=None, slot=None):
                 # Software-pipelined operand reads (mirrors the wgrad v2 kernel):
                 # prefetch the next A fragment while MFMA-ing the current one, and
                 # fetch each mi-invariant B fragment exactly once but interleaved
@@ -556,28 +932,42 @@ def compile_moe_gemm1(
 
                 if const_expr(dma_prefetch is not None):
                     # Reads-first DMA schedule (mixed-MoE / wgrad v2): burst *every* operand
-                    # ds_read for this tile BEFORE issuing the next tile's global->LDS DMA.
-                    # The async buffer_load...lds write is opaque to memory-SSA, so a fresh
-                    # DMA placed immediately in front of the reads makes the backend plant a
-                    # blunt ``s_waitcnt vmcnt(0)`` (the 2.3M-cycle stall the ATT trace shows).
-                    # With the reads ahead of the DMA issue, they instead consume the tile
-                    # staged last iteration (already waited at the previous barrier), and the
-                    # freshly-issued DMA streams under the MFMA burst. sched_barrier fences
-                    # keep the read burst from sinking below the DMA issue.
+                    # ds_read for this tile BEFORE issuing the next tile's global->LDS DMA, so the
+                    # reads consume the tile staged last iteration (already waited at the previous
+                    # barrier) and the freshly-issued DMA streams under the MFMA burst. The
+                    # reads-before-DMA *source order* is the load-bearing invariant: because
+                    # ``buffer_load...lds`` is opaque to memory-SSA, scheduling the DMA in front of
+                    # the reads makes the backend's waitcnt pass plant a blunt ``s_waitcnt vmcnt(0)``
+                    # (measured +30-45% on FC1 no-act). The explicit sched_barrier fences that used
+                    # to bracket the DMA were redundant belt-and-suspenders once the K-loop was
+                    # unrolled to compile-time-constant buffers -- dropping them is perf-neutral to
+                    # marginally faster -- but the ordering itself must stay: do NOT hoist the DMA.
                     a_frags = [
-                        [read_a_frag(a_buf, mi * WMMA_M, kk) for mi in range_constexpr(M_STEPS)]
+                        [
+                            read_a_frag(a_buf, mi * WMMA_M, kk, slot)
+                            for mi in range_constexpr(M_STEPS)
+                        ]
                         for kk in range_constexpr(KK)
                     ]
                     b_frags = [
                         [
-                            read_b_frag(b_bufs[s // N_STEPS], (s % N_STEPS) * WMMA_N, kk)
+                            read_b_frag(
+                                b_bufs[s // N_STEPS], (s % N_STEPS) * WMMA_N, kk,
+                                slot, s // N_STEPS,
+                            )
                             for s in range_constexpr(N_BFRAG)
                         ]
                         for kk in range_constexpr(KK)
                     ]
-                    rocdl.sched_barrier(0)
-                    dma_prefetch()
-                    rocdl.sched_barrier(0)
+                    if const_expr(_DMA_GEP):
+                        # With GEP-rooted LDS destinations the DMA is no longer opaque, so the
+                        # scheduler happily hoists it above the operand reads -- which is the
+                        # one order this loop must not have. Fence it back down.
+                        rocdl.sched_barrier(0)
+                        dma_prefetch()
+                        rocdl.sched_barrier(0)
+                    else:
+                        dma_prefetch()
                     rocdl.s_setprio(1)
                     for kk in range_constexpr(KK):
                         for mi in range_constexpr(M_STEPS):
@@ -594,19 +984,27 @@ def compile_moe_gemm1(
                     rocdl.s_setprio(0)
                     return new
 
+                # Spread the (optional) activation thunks across the KK MFMA groups so each
+                # chunk of silu+ds_write co-issues on the VALU with a matrix burst. The thunks
+                # land inside the raised-priority region, bounded by the per-kk sched_barrier(0),
+                # so they overlap the MFMAs of their group instead of forming a serial prologue.
+                fills = list(act_fill) if const_expr(act_fill is not None) else []
+                n_fill = len(fills)
+                fill_i = 0
+                per_kk = (n_fill + KK - 1) // KK if n_fill else 0
                 rocdl.s_setprio(1)
                 for kk in range_constexpr(KK):
                     def read_b(s):
                         t, nj = s // N_STEPS, s % N_STEPS
-                        return read_b_frag(b_bufs[t], nj * WMMA_N, kk)
+                        return read_b_frag(b_bufs[t], nj * WMMA_N, kk, slot, t)
 
                     b_frags = [None] * N_BFRAG
-                    a_next = read_a_frag(a_buf, 0, kk)
+                    a_next = read_a_frag(a_buf, 0, kk, slot)
                     b_frags[0] = read_b(0)  # first B needed for the very first MFMA
                     for mi in range_constexpr(M_STEPS):
                         a_cur = a_next
                         if const_expr(mi + 1 < M_STEPS):
-                            a_next = read_a_frag(a_buf, (mi + 1) * WMMA_M, kk)
+                            a_next = read_a_frag(a_buf, (mi + 1) * WMMA_M, kk, slot)
                         s = 0
                         for t in range_constexpr(N_BT):
                             for nj in range_constexpr(N_STEPS):
@@ -622,6 +1020,16 @@ def compile_moe_gemm1(
                                 )
                                 s += 1
                         rocdl.sched_barrier(0)
+                    for _ in range_constexpr(per_kk):
+                        if const_expr(fill_i < n_fill):
+                            fills[fill_i]()
+                            fill_i += 1
+                    if const_expr(n_fill):
+                        rocdl.sched_barrier(0)
+                # Drain any remainder (n_fill not divisible by KK).
+                for _ in range_constexpr(n_fill - fill_i):
+                    fills[fill_i]()
+                    fill_i += 1
                 rocdl.s_setprio(0)
                 return new
 
@@ -648,30 +1056,35 @@ def compile_moe_gemm1(
             acc_ty = T.vec(C_FRAG, f32)
 
             if const_expr(use_dma):
-                # ---- DMA path: static 3-buffer ring, distance-2, K-loop unrolled by 3 ----
-                # Each physical iteration processes three contraction sub-tiles. Unrolling by
-                # NUM_BUF (=3) makes every sub-tile's read/write buffer a *Python constant*
-                # (sub-tile j always reads buffer j), so every LDS address is a compile-time
-                # offset and the backend can prove read(buf j) never aliases the in-flight DMA
-                # write(buf j+2). With distance-2 prefetch, sub-tile g issues the DMA for tile
-                # g+2 (consumed two sub-tiles later), so each tile's global->LDS DMA streams
-                # under *two* MFMA bursts before it is read.
+                # ---- DMA path: static NUM_BUF-buffer ring, distance-(NUM_BUF-1), K-loop
+                # unrolled by NUM_BUF ----
+                # Each physical iteration processes NUM_BUF contraction sub-tiles. Unrolling by
+                # NUM_BUF makes every sub-tile's read/write buffer a *Python constant* (sub-tile
+                # j always reads buffer j), so every LDS address is a compile-time offset and the
+                # backend can prove read(buf j) never aliases the in-flight DMA write(buf
+                # (j+DIST)%NUM_BUF). With distance-DIST prefetch, sub-tile g issues the DMA for
+                # tile g+DIST (consumed DIST sub-tiles later), so each tile's global->LDS DMA
+                # streams under *DIST* MFMA bursts before it is read.
                 #
-                # The graduated ``s_waitcnt vmcnt(PER_TILE_DMA)`` at every sub-tile keeps only
-                # the just-issued tile's DMA in flight and drains the older one (the tile the
-                # *next* sub-tile reads). PER_TILE_DMA is a compile-time constant only because
-                # dma_a/dma_b issue a data-independent op count per tile -- hence the
-                # unconditional dma_a above.
-                PER_TILE_DMA = A_FILLS + N_BT * B_FILLS
+                # The graduated ``s_waitcnt vmcnt((DIST-1)*PER_TILE_DMA)`` at every sub-tile keeps
+                # the DIST-1 most-recently-issued tiles' DMA in flight and drains the oldest (the
+                # tile the *next* sub-tile reads). PER_TILE_DMA is a compile-time constant only
+                # because dma_a/dma_b issue a data-independent op count per tile.
+                RING = NUM_BUF
+                DIST = RING - 1
+                PER_TILE_DMA = A_FILLS * (2 if hybrid_a else 1) + N_BT * B_FILLS
+                # Tiles left in flight after each graduated wait. MOE_FWD_DMA_KEEP overrides it
+                # for A/B experiments; values above DIST-1 only stay correct because the backend
+                # plants its own vmcnt(0) ahead of the operand reads.
+                KEEP = _env_int("MOE_FWD_DMA_KEEP", DIST - 1)
                 blk = arith.index(block_k)
-                blk2 = arith.index(2 * block_k)
-                blk3 = arith.index(3 * block_k)
+                blkN = arith.index(RING * block_k)
                 k_i32 = fx.Int32(arith.index_cast(T.i32, K_idx))
                 ntiles = k_i32 // fx.Int32(block_k)
-                # Main-loop end rounded down to a whole number of 3-tile groups; a trailing
-                # 1 or 2 tiles (if any) are handled by the runtime tail below.
+                # Main-loop end rounded down to a whole number of RING-tile groups; a trailing
+                # 0..RING-1 tiles (if any) are handled by the runtime tail below.
                 trip_end = arith.index_cast(
-                    T.index, (ntiles // fx.Int32(3)) * fx.Int32(3 * block_k)
+                    T.index, (ntiles // fx.Int32(RING)) * fx.Int32(RING * block_k)
                 )
 
                 def _clamp_k(kv):
@@ -682,58 +1095,130 @@ def compile_moe_gemm1(
                     # ``wbuf``; clamp past-K offsets to 0 (raw-address resources are not
                     # bounds-checked -- the clamped tile lands in a buffer never read).
                     kc = _clamp_k(k_tile)
-                    dma_a(kc, a_buf_i32(fx.Int32(wbuf)))
+                    dma_a(kc, a_buf_i32(fx.Int32(wbuf)), wbuf)
                     for t in range_constexpr(N_BT):
-                        dma_b(t, kc, b_buf_i32(t, fx.Int32(wbuf)))
+                        dma_b(t, kc, b_buf_i32(t, fx.Int32(wbuf)), wbuf)
 
                 def _sub_tile(rbuf, wbuf, k_pf, accs, do_pf):
-                    # Read constant buffer ``rbuf``; the tile-two-ahead DMA into constant buffer
+                    # Read constant buffer ``rbuf``; the tile-DIST-ahead DMA into constant buffer
                     # ``wbuf`` is issued *inside* compute, after the operand reads (reads-first
                     # schedule), so it overlaps the MFMA burst without forcing a vmcnt(0) drain
                     # in front of the reads. The graduated barrier then drains everything except
-                    # the just-issued tile before the next sub-tile reads its buffer.
+                    # the KEEP newest tiles before the next sub-tile reads its buffer.
                     a_cur = a_buf_elem(fx.Int32(rbuf))
                     b_cur = [b_buf_elem(t, fx.Int32(rbuf)) for t in range_constexpr(N_BT)]
                     pf = (lambda: _dma_tile(k_pf, wbuf)) if const_expr(do_pf) else None
-                    new = compute(accs, a_cur, b_cur, dma_prefetch=pf)
-                    _dma_barrier(PER_TILE_DMA if const_expr(do_pf) else 0)
+                    new = compute(accs, a_cur, b_cur, dma_prefetch=pf, slot=rbuf)
+                    _dma_barrier(KEEP * PER_TILE_DMA if const_expr(do_pf) else 0)
                     return new
 
-                # Prologue: stage the first two tiles (distance-2) into buf0, buf1; full drain.
-                _dma_tile(c0, 0)
-                _dma_tile(blk, 1)
-                _dma_barrier()
+                # Prologue: stage the first DIST tiles (distance-DIST) into buf0..buf(DIST-1).
+                # The first sub-tile reads only buf0 (tile 0), so drain just that one and keep
+                # the KEEP=DIST-1 newest tiles streaming under the first MFMA burst (the graduated
+                # drain matches the steady-state loop). The s_barrier still publishes tile 0's LDS
+                # to the whole workgroup before the first read.
+                for j in range_constexpr(DIST):
+                    _dma_tile(arith.index(j * block_k), j)
+                _dma_barrier(KEEP * PER_TILE_DMA)
 
-                loop = scf.ForOp(c0, trip_end, blk3, iter_args=acc_init)
+                loop = scf.ForOp(c0, trip_end, blkN, iter_args=acc_init)
                 with ir.InsertionPoint(loop.body):
                     k_base = loop.induction_variable
                     accs = [loop.body.arguments[1 + i] for i in range(NACC)]
-                    # sub-tile j reads buf j (tile 3p+j), prefetches tile 3p+j+2 -> buf (j+2)%3
-                    accs = _sub_tile(0, 2, k_base + blk2, accs, True)
-                    accs = _sub_tile(1, 0, k_base + blk3, accs, True)
-                    accs = _sub_tile(2, 1, k_base + blk3 + blk, accs, True)
+                    # sub-tile j reads buf j (tile RING*p+j), prefetches tile RING*p+j+DIST into
+                    # buf (j+DIST)%RING.
+                    for j in range_constexpr(RING):
+                        k_pf = k_base + arith.index((j + DIST) * block_k)
+                        accs = _sub_tile(j, (j + DIST) % RING, k_pf, accs, True)
                     scf.YieldOp(accs)
                 accs = [loop.results[i] for i in range(NACC)]
 
-                # Tail: 0, 1 or 2 leftover tiles, already prefetched into buf0 (and buf1) by the
-                # last group. Drain any DMA still in flight first, then consume without further
-                # prefetch. K is workgroup-uniform, so both branches are uniform.
+                # Tail: 0..RING-1 leftover tiles. The last group's prefetches left tile
+                # (G+m) staged in buf m for m in 0..DIST-1 (G = trip_end tile index), so the
+                # leftover tiles are read straight from buf 0,1,.. with no further prefetch.
+                # Drain any DMA still in flight first. K is workgroup-uniform, so every branch
+                # is uniform. Build the nested "has>=m" chain generically for arbitrary RING.
                 _dma_barrier()
-                rem = ntiles - (ntiles // fx.Int32(3)) * fx.Int32(3)
-                has1 = arith.cmpi(arith.CmpIPredicate.uge, rem, fx.Int32(1))
-                has2 = arith.cmpi(arith.CmpIPredicate.uge, rem, fx.Int32(2))
-                t1 = scf.IfOp(has1, results_=[acc_ty] * NACC, has_else=True)
-                with ir.InsertionPoint(t1.then_block):
-                    a1 = _sub_tile(0, 0, c0, accs, False)
-                    t2 = scf.IfOp(has2, results_=[acc_ty] * NACC, has_else=True)
-                    with ir.InsertionPoint(t2.then_block):
-                        scf.YieldOp(_sub_tile(1, 0, c0, a1, False))
-                    with ir.InsertionPoint(t2.else_block):
-                        scf.YieldOp(a1)
-                    scf.YieldOp([t2.results[i] for i in range(NACC)])
-                with ir.InsertionPoint(t1.else_block):
-                    scf.YieldOp(accs)
-                accs = [t1.results[i] for i in range(NACC)]
+                grp = (ntiles // fx.Int32(RING)) * fx.Int32(RING)
+                rem = ntiles - grp
+
+                def _tail(m, accs_in):
+                    # Consume leftover tile index m (0-based) if rem >= m+1, then recurse.
+                    if const_expr(m >= RING):
+                        return accs_in
+                    has = arith.cmpi(arith.CmpIPredicate.uge, rem, fx.Int32(m + 1))
+                    iff = scf.IfOp(has, results_=[acc_ty] * NACC, has_else=True)
+                    with ir.InsertionPoint(iff.then_block):
+                        acc_m = _sub_tile(m, 0, c0, accs_in, False)
+                        scf.YieldOp(_tail(m + 1, acc_m))
+                    with ir.InsertionPoint(iff.else_block):
+                        scf.YieldOp(accs_in)
+                    return [iff.results[i] for i in range(NACC)]
+
+                accs = _tail(0, accs)
+            elif const_expr(reg_pf2):
+                # ---- Register path, deep VGPR load-ahead: 2 LDS buffers, but the global gather
+                # runs 2 K-tiles ahead (carried in VGPRs via loop iter_args) so each tile's
+                # buffer_load overlaps a whole MFMA+store+barrier cycle. ----
+                def _clamp_k(kv):
+                    return arith.cmpi(arith.CmpIPredicate.ult, kv, K_idx).select(kv, c0)
+
+                # Prologue: stage tile 0 into buf0, then issue tile 1's gather into the carry.
+                store_a_vecs(gather_a_vecs(c0), a_buf_elem(fx.Int32(0)))
+                for t in range_constexpr(N_BT):
+                    store_b_vecs(t, gather_b_vecs(t, c0), b_buf_elem(t, fx.Int32(0)))
+                gpu.barrier()
+
+                k1 = _clamp_k(c0 + step)
+                a_carry0 = gather_a_vecs(k1)
+                b_carry0 = [gather_b_vecs(t, k1) for t in range_constexpr(N_BT)]
+                b_carry0_flat = [v for t in range_constexpr(N_BT) for v in b_carry0[t]]
+                NB = len(b_carry0_flat)
+
+                loop = scf.ForOp(
+                    c0, K_idx, step, iter_args=acc_init + a_carry0 + b_carry0_flat
+                )
+                with ir.InsertionPoint(loop.body):
+                    k_base = loop.induction_variable
+                    args = loop.body.arguments
+                    accs = [args[1 + i] for i in range(NACC)]
+                    a_carry = [args[1 + NACC + i] for i in range(A_VECS_PER)]
+                    b_carry_flat = [args[1 + NACC + A_VECS_PER + i] for i in range(NB)]
+                    b_carry = []
+                    off = 0
+                    for t in range_constexpr(N_BT):
+                        b_carry.append(b_carry_flat[off:off + B_VECS_PER[t]])
+                        off += B_VECS_PER[t]
+
+                    it = fx.Int32(arith.index_cast(T.i32, k_base)) // fx.Int32(block_k)
+                    cur = it % fx.Int32(2)
+                    nxt = fx.Int32(1) - cur
+                    a_cur = a_buf_elem(cur)
+                    b_cur = [b_buf_elem(t, cur) for t in range_constexpr(N_BT)]
+
+                    # Store the already-loaded tile (it+1) carried from last iteration into nxt.
+                    # With silu_pipe the A activation+store is deferred into ``compute`` (see
+                    # act_fill) so the v_exp overlaps the MFMA; the B store (no activation) stays
+                    # ahead of compute either way.
+                    a_fill = None
+                    if const_expr(silu_pipe):
+                        a_fill = store_a_thunks(a_carry, a_buf_elem(nxt))
+                    else:
+                        store_a_vecs(a_carry, a_buf_elem(nxt))
+                    for t in range_constexpr(N_BT):
+                        store_b_vecs(t, b_carry[t], b_buf_elem(t, nxt))
+
+                    # Issue tile (it+2)'s global gather now (streams under this tile's MFMA).
+                    k2 = _clamp_k(k_base + step + step)
+                    a_next = gather_a_vecs(k2)
+                    b_next = [gather_b_vecs(t, k2) for t in range_constexpr(N_BT)]
+                    b_next_flat = [v for t in range_constexpr(N_BT) for v in b_next[t]]
+
+                    new_accs = compute(accs, a_cur, b_cur, act_fill=a_fill)
+                    rocdl.sched_barrier(0)
+                    gpu.barrier()
+                    scf.YieldOp(new_accs + a_next + b_next_flat)
+                accs = [loop.results[i] for i in range(NACC)]
             else:
                 # ---- Register path: 2-buffer ping/pong (global->VGPR->ds_write) ----
                 store_a(gather_a(c0), a_buf_elem(fx.Int32(0)))
@@ -770,8 +1255,7 @@ def compile_moe_gemm1(
                 accs = [loop.results[i] for i in range(NACC)]
 
             # ---- Epilogue: gated act(+prob)(+preact) or plain store ----
-            e_pm = arith.index_cast(T.index, expert) * arith.index_cast(T.index, stride_pe)
-            stride_pm_idx = arith.index_cast(T.index, stride_pm)
+            # (e_pm / stride_pm_idx were hoisted above so the FC2 gated_a prologue can use them.)
             for mi in range_constexpr(M_STEPS):
                 for nj in range_constexpr(N_STEPS):
                     ncol = warp_n_base + fx.Int32(nj * WMMA_N) + lane_row
@@ -813,6 +1297,12 @@ def compile_moe_gemm1(
                                 scf.YieldOp([])
                         else:
                             v = vector.extract(ac, static_position=[ii], dynamic_position=[])
+                            if const_expr(gated_a and mul_prob):
+                                # FC2 fused prologue: A already holds act(gate)*up; the per-route
+                                # prob factors out of the GEMM and is applied here (out *= prob[m]).
+                                p_off = token_ok.select(slot_idx, c0) * stride_pm_idx + e_pm
+                                prob = buffer_load_f32(probs_rsrc, p_off)
+                                v = arith.mulf(v, prob)
                             cval = arith.truncf(bf16, v)
                             store_if = scf.IfOp(store_ok, results_=[], has_else=False)
                             with ir.InsertionPoint(store_if.then_block):
