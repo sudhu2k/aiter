@@ -264,10 +264,12 @@ def compile_moe_gemm1(
     # false cross-slot ones, so the pass can emit a graduated vmcnt. The read side must be an
     # ``llvm.load`` because ``vector.load`` has no alias-metadata operand. Recipe mirrors the
     # mxfp8 4-wave HK kernels (``flydsl_4wave_hk.py`` / ``kernel_grouped_4wave.py``).
-    # ``transpose_b`` reads B through ``ds_read_tr`` and ``hybrid_a`` reads a second parallel
-    # up-tile; both would need scopes of their own, so they fall back to the unscoped reads
-    # rather than silently mixing a scoped write with an unscoped read (which is still
-    # MayAlias, i.e. no gain, and would make the flag break those configs).
+    # ``transpose_b`` (dgrad) reads B through ``ds_read_tr16_b64``: it is scoped via the same
+    # recipe as the wgrad v2 kernel -- the read is GEP-rooted off ``_lds_root`` for provenance
+    # and the ``ds_read`` carries the ring-slot scope (see ``_tr_read_frag``). ``hybrid_a`` reads
+    # a second parallel up-tile that would need scopes of its own, so it still falls back to the
+    # unscoped reads rather than silently mixing a scoped write with an unscoped read (which is
+    # still MayAlias, i.e. no gain, and would make the flag break that config).
     #
     # On by default (opt out with ``MOE_FWD_DMA_ALIAS=0``). ATT on FC1 no-act (qwen235b,
     # 256x256x32 w4x4) shows the ``s_waitcnt vmcnt`` stall bucket dropping 29.2% -> 8.0% of
@@ -277,7 +279,7 @@ def compile_moe_gemm1(
     # and roughly a wash to slightly negative at block_k=64 (+1%), where the two extra VGPRs
     # the scoped loads cost are not repaid.
     _DMA_ALIAS = (
-        use_dma and not transpose_b and not hybrid_a and _env_on("MOE_FWD_DMA_ALIAS", True)
+        use_dma and not hybrid_a and _env_on("MOE_FWD_DMA_ALIAS", True)
     )
     if _DMA_ALIAS:
         # The DMA destination must be a GEP off the LDS object for the fill and the read to
@@ -901,9 +903,21 @@ def compile_moe_gemm1(
             def read_b_frag(buf_elem, atom_off, kk, slot=None, t=0):
                 if const_expr(transpose_b):
                     buf_byte = arith.index_cast(T.i32, buf_elem) * fx.Int32(2)
+                    # dgrad transpose read: GEP off the LDS root (provenance) and carry the
+                    # ring-slot alias scope so SIInsertWaitcnts keeps older fills in flight
+                    # instead of draining vmcnt to 0 before the ds_read (see wgrad v2 recipe).
+                    if const_expr(_DMA_ALIAS):
+                        _tr_root = _lds_root
+                        _tr_alias = (
+                            _scope_kw(_b_sid(t, slot)) if slot is not None else None
+                        )
+                    else:
+                        _tr_root = None
+                        _tr_alias = None
                     return _tr_read_frag(
                         b_lds_off, SB, warp_n_base, atom_off, kk,
                         lane_kg, tr_k_group, tr_col_sub, buf_byte, use_swz,
+                        lds_root=_tr_root, alias_kw=_tr_alias,
                     )
                 row = warp_n_base + atom_off + lane_row
                 col = fx.Int32(kk * WMMA_K) + lane_kg * fx.Int32(8)
@@ -1357,8 +1371,12 @@ compile_moe_fwd_v2 = compile_moe_gemm1
 compile_moe_fwd = compile_moe_gemm1
 
 
-def _tr_lds_ptr(lds_off, byte_elem, buf_byte):
+def _tr_lds_ptr(lds_off, byte_elem, buf_byte, lds_root=None):
     byte = byte_elem * fx.Int32(2) + fx.Int32(lds_off) + buf_byte
+    if lds_root is not None:
+        # GEP off the real LDS object so the transpose read shares a base with the DMA fill;
+        # the aliasing analysis needs this provenance (an inttoptr address is opaque to it).
+        return buffer_ops.get_element_ptr(lds_root, byte_offset=byte)
     byte_i64 = arith.index_cast(T.i64, arith.index_cast(T.index, byte))
     return _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), byte_i64).result
 
@@ -1366,6 +1384,7 @@ def _tr_lds_ptr(lds_off, byte_elem, buf_byte):
 def _tr_read_frag(
     lds_off, stride, warp_col_base, col_const, kk,
     lane_m_base, tr_k_group, tr_col_sub, buf_byte, use_swz=False,
+    lds_root=None, alias_kw=None,
 ):
     """ds_read_tr16_b64 B fragment for a 16-wide feature (n) column from a [k, n] LDS tile.
 
@@ -1384,25 +1403,25 @@ def _tr_read_frag(
 
     if use_swz:
         n_read = col_run + fx.Int32(col_const)     # actual feature column this lane reads
-        lo_ptr = _tr_lds_ptr(lds_off, _swz_elem(row_lo, n_read, stride), buf_byte)
+        lo_ptr = _tr_lds_ptr(lds_off, _swz_elem(row_lo, n_read, stride), buf_byte, lds_root)
         hi_ptr = _tr_lds_ptr(
-            lds_off, _swz_elem(row_lo + fx.Int32(4), n_read, stride), buf_byte
+            lds_off, _swz_elem(row_lo + fx.Int32(4), n_read, stride), buf_byte, lds_root
         )
-        lo = _ds_read_tr_bf16x4(lo_ptr)
-        hi = _ds_read_tr_bf16x4(hi_ptr)
+        lo = _ds_read_tr_bf16x4(lo_ptr, alias_kw=alias_kw)
+        hi = _ds_read_tr_bf16x4(hi_ptr, alias_kw=alias_kw)
         return lo.shuffle(hi, [0, 1, 2, 3, 4, 5, 6, 7])
 
     base_elem = row_lo * fx.Int32(stride) + col_run
-    base_ptr = _tr_lds_ptr(lds_off, base_elem, buf_byte)
+    base_ptr = _tr_lds_ptr(lds_off, base_elem, buf_byte, lds_root)
 
     col_byte = 2 * col_const       # compile-time feature-column shift (bytes)
     hi_byte = 2 * 4 * stride        # compile-time lo->hi row shift (4 rows apart)
-    lo = _ds_read_tr_bf16x4(base_ptr, col_byte)
-    hi = _ds_read_tr_bf16x4(base_ptr, col_byte + hi_byte)
+    lo = _ds_read_tr_bf16x4(base_ptr, col_byte, alias_kw=alias_kw)
+    hi = _ds_read_tr_bf16x4(base_ptr, col_byte + hi_byte, alias_kw=alias_kw)
     return lo.shuffle(hi, [0, 1, 2, 3, 4, 5, 6, 7])
 
 
-def _ds_read_tr_bf16x4(base_ptr, const_byte=0):
+def _ds_read_tr_bf16x4(base_ptr, const_byte=0, alias_kw=None):
     if const_byte:
         ptr = _llvm.GEPOp(
             ir.Type.parse("!llvm.ptr<3>"),
@@ -1414,7 +1433,7 @@ def _ds_read_tr_bf16x4(base_ptr, const_byte=0):
         ).result
     else:
         ptr = base_ptr
-    raw = rocdl.ds_read_tr16_b64(T.vec(4, T.bf16), ptr).result
+    raw = rocdl.ds_read_tr16_b64(T.vec(4, T.bf16), ptr, **(alias_kw or {})).result
     return fx.Vector(raw, (4,), fx.BFloat16)
 
 

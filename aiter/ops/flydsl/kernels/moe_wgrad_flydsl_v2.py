@@ -149,6 +149,19 @@ def compile_moe_wgrad_v2(
     G_FILLS = (WGRAD_BLOCK_M * block_n) // (n_threads * FILL_V)
     X_FILLS = (WGRAD_BLOCK_M * block_k) // (n_threads * FILL_V)
 
+    # Per-ring-slot LLVM alias scopes on the LDS-DMA writes and the transpose reads, so
+    # SIInsertWaitcnts can prove read(buf j) never aliases the in-flight DMA fill of the
+    # *other* buffers and emit a graduated ``s_waitcnt vmcnt(N)`` instead of draining to 0 in
+    # front of every ds_read. Only the DMA+swizzle path stages operands through
+    # buffer_load_lds (the register path uses lgkmcnt-tracked ds_writes, so it never needs
+    # this), which is why aliasing is gated on ``dma_swizzle``. Both the fill and the
+    # swizzled transpose read already GEP off the ``@smem`` global (provenance); the scopes
+    # add the alias-analysis info the pass keys on. Mirrors the fwd MOE_FWD_DMA_ALIAS recipe;
+    # on by default (opt out with ``MOE_WGRAD_DMA_ALIAS=0``).
+    _DMA_ALIAS = bool(dma_swizzle) and os.environ.get(
+        "MOE_WGRAD_DMA_ALIAS", "1"
+    ).strip().lower() not in ("0", "false", "no", "off", "")
+
     out_is_f32 = out_dtype == "fp32"
     KERNEL_NAME = (
         f"moe_wgrad_routelist_{dtype}"
@@ -157,7 +170,8 @@ def compile_moe_wgrad_v2(
         f"{'_o32' if out_is_f32 else ''}{'_acc' if accumulate else ''}"
         f"{'_swp' if swap_gather else ''}{'_dsz' if dma_swizzle else ''}"
         f"{'_s' + str(pipe_stages) if pipe_stages != 2 else ''}"
-        f"{'_agpr' if agpr_accumulators else ''}_v2"
+        f"{'_agpr' if agpr_accumulators else ''}"
+        f"{'_dsa' if _DMA_ALIAS else ''}_v2"
     )
 
     # LDS allocation: NUM_BUF-buffered grad tile + x tile (2 bytes/bf16). The non-DMA
@@ -224,6 +238,45 @@ def compile_moe_wgrad_v2(
 
         warp_n_base = wn_id * fx.Int32(WN)     # grad-feature col base of this warp
         warp_k_base = wk_id * fx.Int32(WK)     # x-feature col base of this warp
+
+        # One alias scope per (operand, ring slot): the grad tile and the x tile each own
+        # NUM_BUF disjoint LDS byte ranges. A fill of slot r and a read of slot r share a
+        # scope so their RAW dependency survives; every other pair (different slot, or the
+        # other operand) is marked noalias, which is what lets SIInsertWaitcnts keep older
+        # in-flight fills streaming instead of draining vmcnt to 0 before each transpose read.
+        if const_expr(_DMA_ALIAS):
+            _ALIAS_DOMAIN = '#llvm.alias_scope_domain<id = "moe_wgrad_lds">'
+            _SCOPE_IDS = tuple(
+                [f"g{r}" for r in range(NUM_BUF)] + [f"x{r}" for r in range(NUM_BUF)]
+            )
+
+            def _scope_attr(ids):
+                inner = ", ".join(
+                    f'#llvm.alias_scope<id = "{sid}", domain = {_ALIAS_DOMAIN}>'
+                    for sid in ids
+                )
+                return ir.Attribute.parse(f"[{inner}]")
+
+            _MY_SCOPE = {sid: _scope_attr((sid,)) for sid in _SCOPE_IDS}
+            _NOALIAS_SCOPE = {
+                sid: _scope_attr(tuple(o for o in _SCOPE_IDS if o != sid))
+                for sid in _SCOPE_IDS
+            }
+
+        def _g_sid(slot):
+            return f"g{slot % NUM_BUF}"
+
+        def _x_sid(slot):
+            return f"x{slot % NUM_BUF}"
+
+        def _scope_kw(sid):
+            """alias/noalias metadata kwargs for one (operand, ring slot), or {}."""
+            if const_expr(not _DMA_ALIAS or sid is None):
+                return {}
+            return {
+                "alias_scopes": _MY_SCOPE[sid],
+                "noalias_scopes": _NOALIAS_SCOPE[sid],
+            }
 
         # The pinned w2x2 path keeps its f32x4 output fragments in a fixed prefix of
         # a[0:255] for the complete slot loop, rather than carrying vector SSA values
@@ -461,7 +514,7 @@ def compile_moe_wgrad_v2(
                 )
 
         def _dma_one(rsrc, ids, slot_base_idx, cpr, feat_base_idx, dim_idx, lds_off,
-                     buf_byte, n_fills, clamp_row):
+                     buf_byte, n_fills, clamp_row, sid=None):
             # Issue the global->LDS DMA for one operand: each lane streams FILL_V bf16
             # from ``global[row, swizzled_feat]`` straight into contiguous LDS (no VGPR
             # staging). The LDS destination base is wave-uniform (readfirstlane); the
@@ -498,16 +551,22 @@ def compile_moe_wgrad_v2(
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc, _gep_lds(smem_raw_ptr, lds_base), fx.Int32(FILL_V * 2),
                     voff_byte, fx.Int32(0), fx.Int32(0), fx.Int32(1),
+                    **_scope_kw(sid),
                 )
 
-        def dma_fill(g_ids, x_ids, slot_base_idx, g_buf_byte, x_buf_byte):
+        def dma_fill(g_ids, x_ids, slot_base_idx, g_buf_byte, x_buf_byte, wbuf=None):
             # The token-gathered operand walks by SORTED token (clamp_row=False, OOB->0 via
             # its bounded resource); its contiguous route-walk partner uses clamp_row=True.
-            # FC1 gathers ``x``; FC2 (swap_gather) gathers ``grad`` instead.
+            # FC1 gathers ``x``; FC2 (swap_gather) gathers ``grad`` instead. ``wbuf`` is the
+            # Python ring-slot index this tile is being staged into (for the alias scopes).
+            g_sid = _g_sid(wbuf) if wbuf is not None else None
+            x_sid = _x_sid(wbuf) if wbuf is not None else None
             _dma_one(grad_rsrc, g_ids, slot_base_idx, CPR_G_SWZ, n_base_idx, N_idx,
-                     g_lds_off, g_buf_byte, G_FILLS, clamp_row=const_expr(not swap_gather))
+                     g_lds_off, g_buf_byte, G_FILLS, clamp_row=const_expr(not swap_gather),
+                     sid=g_sid)
             _dma_one(x_rsrc, x_ids, slot_base_idx, CPR_X_SWZ, k_base_idx, K_idx,
-                     x_lds_off, x_buf_byte, X_FILLS, clamp_row=const_expr(swap_gather))
+                     x_lds_off, x_buf_byte, X_FILLS, clamp_row=const_expr(swap_gather),
+                     sid=x_sid)
 
         def _dma_barrier(keep=0):
             # DMA lands on vmcnt (global load); drain it before the workgroup barrier so
@@ -522,7 +581,7 @@ def compile_moe_wgrad_v2(
                 constraints="", has_side_effects=True, is_align_stack=False,
             )
 
-        def compute(accs, g_buf_byte, x_buf_byte, dma_prefetch=None):
+        def compute(accs, g_buf_byte, x_buf_byte, dma_prefetch=None, slot=None):
             # A fragments are read one-per-mi to keep VGPR pressure low (hoisting all of
             # them costs occupancy, which the large tile-count shapes depend on). B
             # fragments are loop-invariant across mi, so they are fetched exactly once --
@@ -530,11 +589,15 @@ def compile_moe_wgrad_v2(
             # burst up front, so their ds_read latency overlaps compute. The MFMA region
             # runs at raised priority so the matrix pipe stays fed while reads are in
             # flight instead of the scheduler round-robining to a stalled wave.
+            g_read_sid = _g_sid(slot) if slot is not None else None
+            x_read_sid = _x_sid(slot) if slot is not None else None
+
             def read_a(mi):
                 if const_expr(dma_swizzle):
                     return _tr_read_frag_swz(
                         smem_raw_ptr, g_lds_off, SG, CPR_G_SWZ, warp_n_base, mi * WMMA_M,
                         lane_m_base, tr_k_group, tr_col_sub, g_buf_byte,
+                        alias_kw=_scope_kw(g_read_sid),
                     )
                 return _tr_read_frag(
                     g_lds_off, SG, warp_n_base, mi * WMMA_M,
@@ -546,6 +609,7 @@ def compile_moe_wgrad_v2(
                     return _tr_read_frag_swz(
                         smem_raw_ptr, x_lds_off, SX, CPR_X_SWZ, warp_k_base, nj * WMMA_N,
                         lane_m_base, tr_k_group, tr_col_sub, x_buf_byte,
+                        alias_kw=_scope_kw(x_read_sid),
                     )
                 return _tr_read_frag(
                     x_lds_off, SX, warp_k_base, nj * WMMA_N,
@@ -687,13 +751,15 @@ def compile_moe_wgrad_v2(
                 return sets
 
             def mk_prefetch(g_ids, x_ids, pf_slot, wbuf):
-                return lambda: dma_fill(g_ids, x_ids, pf_slot, g_byte(wbuf), x_byte(wbuf))
+                return lambda: dma_fill(
+                    g_ids, x_ids, pf_slot, g_byte(wbuf), x_byte(wbuf), wbuf=wbuf
+                )
 
             # Prologue: stage tiles 0..D-1 into buffers 0..D-1 (distance-D), then drain fully.
             for j in range_constexpr(D):
                 j_slot = arith.index(j * WMMA_K)
                 gidj, xidj = load_slot_ids(j_slot)
-                dma_fill(gidj, xidj, j_slot, g_byte(j), x_byte(j))
+                dma_fill(gidj, xidj, j_slot, g_byte(j), x_byte(j), wbuf=j)
             _dma_barrier()
             # Initial carried id-sets: iteration 0 prefetches tiles D..D+NUM_BUF-1.
             init_sets = [
@@ -728,6 +794,7 @@ def compile_moe_wgrad_v2(
                     accs = compute(
                         accs, g_byte(j), x_byte(j),
                         dma_prefetch=mk_prefetch(g_ids_j, x_ids_j, pf_slot, j + D),
+                        slot=j,
                     )
                     _dma_barrier(KEEP)
 
@@ -753,7 +820,7 @@ def compile_moe_wgrad_v2(
                     has_j = arith.cmpi(arith.CmpIPredicate.ugt, rem, fx.Int32(j))
                     tif = scf.IfOp(has_j, results_=[], has_else=False)
                     with ir.InsertionPoint(tif.then_block):
-                        compute(accs, g_byte(j), x_byte(j), dma_prefetch=None)
+                        compute(accs, g_byte(j), x_byte(j), dma_prefetch=None, slot=j)
                         scf.YieldOp([])
             else:
                 def _tail(j, accs):
@@ -762,7 +829,7 @@ def compile_moe_wgrad_v2(
                     has_j = arith.cmpi(arith.CmpIPredicate.ugt, rem, fx.Int32(j))
                     tif = scf.IfOp(has_j, results_=[acc_ty] * NACC, has_else=True)
                     with ir.InsertionPoint(tif.then_block):
-                        a2 = compute(accs, g_byte(j), x_byte(j), dma_prefetch=None)
+                        a2 = compute(accs, g_byte(j), x_byte(j), dma_prefetch=None, slot=j)
                         scf.YieldOp(_tail(j + 1, a2))
                     with ir.InsertionPoint(tif.else_block):
                         scf.YieldOp(accs)
@@ -958,7 +1025,7 @@ def _gep_lds(base_ptr, byte_i32):
 
 def _tr_read_frag_swz(
     smem_base, lds_off, stride, cpr, warp_col_base, col_const,
-    lane_m_base, tr_k_group, tr_col_sub, buf_byte,
+    lane_m_base, tr_k_group, tr_col_sub, buf_byte, alias_kw=None,
 ):
     """Swizzled counterpart of ``_tr_read_frag`` for the DMA fill (un-padded LDS).
 
@@ -986,7 +1053,9 @@ def _tr_read_frag_swz(
         phys_feat = phys_chunk * fx.Int32(FILL_V) + within
         elem = slot * fx.Int32(stride) + phys_feat
         byte = elem * fx.Int32(2) + fx.Int32(lds_off) + buf_byte
-        raw = rocdl.ds_read_tr16_b64(T.vec(4, T.bf16), _gep_lds(smem_base, byte)).result
+        raw = rocdl.ds_read_tr16_b64(
+            T.vec(4, T.bf16), _gep_lds(smem_base, byte), **(alias_kw or {})
+        ).result
         return fx.Vector(raw, (4,), fx.BFloat16)
 
     lo = _read(row_lo)
