@@ -55,6 +55,52 @@ def _resolve_dma_opts(swap_gather: bool):
     return dma, stages
 
 
+def _v3_wgrad_active() -> bool:
+    """Whether the MegaMOE-port v3 wgrad kernel is selected.
+
+    Gated behind its *own* ``AITER_MOE_FLYDSL_V3_WGRAD`` flag (NOT the shared
+    ``AITER_MOE_FLYDSL_V3`` that drives fwd/dgrad): the wgrad port is numerically exact but
+    ~0.5-0.65x of the tuned v2 kernel because its gather is on the contraction (token) axis --
+    ``SORTED`` indices reload every K-step and the X fetch is non-coalesced, unlike the
+    K-invariant fwd/dgrad row gather. So v3 fwd/dgrad stay a win while wgrad keeps v2 by default.
+    """
+    return _env_flag("AITER_MOE_FLYDSL_V3_WGRAD", False)
+
+
+def _try_run_v3_wgrad(
+    x, grad, dw, sorted_slot_ids, block_start, blocks_per_expert, route_start,
+    num_recv_tokens, accumulate, out_dtype, swap_gather,
+) -> bool:
+    """Dispatch to the v3 (MegaMOE variable-K) wgrad kernel when it applies; else ``False``.
+
+    The v3 kernel is the FC1 wgrad path only (``X`` gathered on the contraction, compact grad),
+    bf16 overwrite. Unsupported requests (FC2 ``swap_gather``, fp32/accumulate epilogue, or a dW
+    whose feature dims don't tile the fixed 256x256 geometry) fall through to the v2 kernel. The
+    routing metadata must be 256-aligned (TE's ``_wgrad_contract_m`` handles this under the flag).
+    """
+    if not _v3_wgrad_active():
+        return False
+    if swap_gather or accumulate or out_dtype != "bf16":
+        return False
+    E, N, K = dw.shape
+    from .kernels.moe_wgrad_flydsl_v3 import grouped_gemm_wgrad_gather_bf16, WGRAD_ALIGN
+
+    if K % 256 != 0 or N % 256 != 0:
+        return False
+    grouped_gemm_wgrad_gather_bf16(
+        x,
+        grad,
+        sorted_slot_ids,
+        block_start,
+        blocks_per_expert,
+        route_start,
+        num_recv_tokens=int(num_recv_tokens),
+        out=dw,
+        out_dtype=torch.bfloat16,
+    )
+    return True
+
+
 def _resolve_out_dtype(dw: torch.Tensor, out_dtype):
     """Pick the kernel ``out_dtype`` ('bf16'/'fp32') and validate it against ``dw``."""
     if out_dtype is None:
@@ -119,6 +165,12 @@ def flydsl_moe_wgrad(
     assert x.is_contiguous() and grad.is_contiguous() and dw.is_contiguous()
     out_dtype = _resolve_out_dtype(dw, out_dtype)
 
+    if _try_run_v3_wgrad(
+        x, grad, dw, sorted_slot_ids, block_start, blocks_per_expert, route_start,
+        num_recv_tokens, accumulate, out_dtype, swap_gather,
+    ):
+        return
+
     # Fill/pipeline knobs default to the env-configured best config; explicit args win.
     _dma, _stages = _resolve_dma_opts(bool(swap_gather))
     if dma_swizzle is not None:
@@ -168,6 +220,12 @@ _AUTOTUNE_TILES = [
     (256, 256, 4, 4),
     (128, 256, 2, 4),
     (256, 128, 2, 2),
+    # 256x256 at 8 waves (512 threads): the Mega variable-K geometry. On DeepSeek-V3 FC1
+    # wgrad this hits ~999 TF (88.5% of Mega's ~1131) vs the 128x128/w2x2 config's ~911 TF --
+    # the 1024-thread (256,256,4,4) above instead collapses (occupancy). Added so the tuner can
+    # pick the 8-wave 256x256 on the large FC shapes where it dominates.
+    (256, 256, 2, 4),
+    (256, 256, 4, 2),
 ]
 
 _wgrad_autotuner = None
@@ -300,6 +358,12 @@ def flydsl_moe_wgrad_autotuned(
     assert x.dtype == grad.dtype == torch.bfloat16
     assert x.is_contiguous() and grad.is_contiguous() and dw.is_contiguous()
     out_dtype = _resolve_out_dtype(dw, out_dtype)
+
+    if _try_run_v3_wgrad(
+        x, grad, dw, sorted_slot_ids, block_start, blocks_per_expert, route_start,
+        num_recv_tokens, accumulate, out_dtype, swap_gather,
+    ):
+        return
 
     if not accumulate and out_dtype == "bf16" and not swap_gather:
         _get_autotuner()(
